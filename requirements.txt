@@ -1,0 +1,27 @@
+# MST-Pipeline Python Dependencies
+# Install with: pip install -r requirements.txt
+# NOTE: R packages, bioinformatics tools, and sourcetracker must be installed via Conda (see setup scripts)
+
+# --- Web Framework ---
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+
+# --- Dashboard ---
+dash>=2.14.0
+dash-bootstrap-components>=1.5.0
+dash-uploader>=0.7.0
+plotly>=5.18.0
+
+# --- Database ---
+sqlalchemy>=2.0.0
+
+# --- Data Science ---
+pandas>=2.1.0
+numpy>=1.25.0
+scipy>=1.11.0
+biopython>=1.81
+
+# --- BIOM format ---
+biom-format>=2.1.0
+h5py>=3.9.0

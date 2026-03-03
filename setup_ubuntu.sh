@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# setup_wsl.sh  —  MST-Pipeline conda setup for Windows WSL
+# setup_ubuntu.sh  —  MST-Pipeline conda setup for Ubuntu
 # =============================================================================
 #
 # Creates TWO conda environments:
@@ -17,7 +17,7 @@
 #     • Called via:   conda run --no-capture-output -n ST python3 _run_gibbs.py
 #
 # Usage:
-#   bash setup_wsl.sh
+#   bash setup_ubuntu.sh
 #
 # Requirements:
 #   • Miniconda or Anaconda installed
@@ -255,7 +255,4 @@ echo -e "  ${BOLD}Or without activating:${RESET}"
 echo -e "    conda run -n ${ENV_MAIN} uvicorn app.main:app --host 0.0.0.0 --port 8050"
 echo
 echo -e "  Then open ${CYAN}http://localhost:8050${RESET} in your browser."
-echo
-echo -e "  ${BOLD}WSL tip:${RESET} The browser may not open automatically."
-echo -e "  Navigate to ${CYAN}http://localhost:8050${RESET} in your Windows browser."
 echo

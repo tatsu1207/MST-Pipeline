@@ -66,6 +66,14 @@ if snk_depth > snk_min:
           f"capping to {snk_min}", flush=True)
     snk_depth = snk_min
 
+if src_depth <= 0:
+    print("ERROR: source depth is 0 after capping — no aligned reads in source groups.", flush=True)
+    sys.exit(1)
+if snk_depth <= 0:
+    print("ERROR: sink depth is 0 after capping — no aligned reads in sink samples. "
+          "This usually means no ASV sequences matched the source reference database.", flush=True)
+    sys.exit(1)
+
 print(f"Sources: {source_df.shape}  (depth→{src_depth})", flush=True)
 print(f"Sinks:   {sink_df.shape}  (depth→{snk_depth})", flush=True)
 
