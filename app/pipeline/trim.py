@@ -8,10 +8,12 @@ import os
 import subprocess
 from pathlib import Path
 
+from app.config import is_long_read
 from app.pipeline.detect import (
     REGION_PRIMERS,
     _primer_matches,
     _read_fastq_sequences,
+    _reverse_complement,
     detect_sequencing_type,
     extract_sample_name,
 )
@@ -71,7 +73,11 @@ def run_cutadapt(
 
     trim_stats = {"total_reads": 0, "trimmed_reads": 0, "samples_processed": 0}
 
-    if is_paired:
+    if is_long_read(variable_region):
+        _trim_long_read(
+            fastq_files, trimmed_dir, fwd_primer, rev_primer, logger, trim_stats, threads
+        )
+    elif is_paired:
         _trim_paired(
             fastq_files, trimmed_dir, fwd_primer, rev_primer, logger, trim_stats, threads
         )
@@ -196,6 +202,50 @@ def _trim_single(
         stats["samples_processed"] += 1
         _parse_cutadapt_stats(result.stderr, stats)
         logger.info(f"  Trimmed: {sample}")
+
+
+def _trim_long_read(
+    fastq_files: list[Path],
+    trimmed_dir: Path,
+    fwd_primer: str,
+    rev_primer: str,
+    logger: logging.Logger,
+    stats: dict,
+    threads: int = 1,
+):
+    """Trim long-read (full-length 16S) files using cutadapt with --rc.
+
+    Handles both orientations of PacBio/Nanopore reads.
+    Trims 27F from 5' and rc(1492R) from 3', with length filtering.
+    """
+    rev_primer_rc = _reverse_complement(rev_primer) if rev_primer else ""
+
+    for fq in fastq_files:
+        out = trimmed_dir / fq.name
+        cmd = [
+            "cutadapt",
+            "-j", str(threads),
+            "--rc",  # handle both read orientations
+            "-g", f"^{fwd_primer}",  # 27F at 5'
+        ]
+        if rev_primer_rc:
+            cmd += ["-a", f"{rev_primer_rc}$"]  # rc(1492R) at 3'
+        cmd += [
+            "--minimum-length", "1000",
+            "--maximum-length", "1600",
+            "--discard-untrimmed",
+            "-o", str(out),
+            str(fq),
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        if result.returncode != 0:
+            raise RuntimeError(f"Cutadapt (long-read) failed for {fq.name}: {result.stderr[:300]}")
+
+        sample = extract_sample_name(fq.name)
+        stats["samples_processed"] += 1
+        _parse_cutadapt_stats(result.stderr, stats)
+        logger.info(f"  Trimmed (long-read): {sample}")
 
 
 def _parse_cutadapt_stats(stderr: str, stats: dict):

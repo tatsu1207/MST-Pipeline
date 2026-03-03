@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, File, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
-from app.config import UPLOAD_DIR
+from app.config import UPLOAD_DIR, to_absolute, to_relative
 from app.db.database import get_db
 from app.db.models import FastqFile, Upload
 from app.pipeline.detect import detect_sequencing_type, extract_sample_name
@@ -54,8 +54,8 @@ async def upload_files(files: list[UploadFile] = File(...), db: Session = Depend
         for direction, filename in [("R1", file_map.get("R1")), ("R2", file_map.get("R2"))]:
             if not filename:
                 continue
-            file_path = str(UPLOAD_DIR / filename)
-            file_size = os.path.getsize(file_path) / (1024 * 1024) if os.path.exists(file_path) else 0
+            abs_path = UPLOAD_DIR / filename
+            file_size = os.path.getsize(abs_path) / (1024 * 1024) if abs_path.exists() else 0
 
             read_dir = direction
             if detection["type"] == "single-end":
@@ -65,7 +65,7 @@ async def upload_files(files: list[UploadFile] = File(...), db: Session = Depend
                 upload_id=upload.id,
                 sample_name=sample_name,
                 filename=filename,
-                file_path=file_path,
+                file_path=to_relative(abs_path),
                 read_direction=read_dir,
                 file_size_mb=round(file_size, 2),
             )
@@ -92,7 +92,7 @@ def download_file(upload_id: int, filename: str, db: Session = Depends(get_db)):
     )
     if not fastq:
         return {"error": "File not found"}
-    file_path = Path(fastq.file_path)
+    file_path = to_absolute(fastq.file_path)
     if not file_path.exists():
         # Fallback: file may be in flat UPLOAD_DIR
         file_path = UPLOAD_DIR / filename

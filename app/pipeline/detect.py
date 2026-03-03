@@ -113,7 +113,17 @@ PRIMERS = {
     "806R": "GACTACNVGGGTWTCTAATCC",
     "515F_RC": "TTACCGCGGCKGCTGRCAC",
     "806R_RC": "GGATTAGAWACCCBNGTAGTC",
+    "27F": "AGAGTTTGATCMTGGCTCAG",
+    "1492R": "TACGGYTACCTTGTTACGACTT",
 }
+
+_COMPLEMENT = str.maketrans("ACGTRYMKSWBDHVNacgtryMkswbdhvn",
+                            "TGCAYRKMSWVHDBNtgcayrkmswvhdbn")
+
+
+def _reverse_complement(seq: str) -> str:
+    """Return the reverse complement of an IUPAC sequence."""
+    return seq.translate(_COMPLEMENT)[::-1]
 
 REGION_PRIMERS = {
     "V4": {
@@ -224,7 +234,17 @@ def fast_identify_vregion(r1_prefix: str, r2_prefix: str) -> str | None:
     """Identify V-region from read prefixes without running bbmap.
 
     Returns the region string, or None when primers are absent/ambiguous.
+    Checks for 27F (full-length 16S) before 515F (short-read regions).
     """
+    # Check 27F first — long-read full-length 16S (V1-V9)
+    r1_27F = _prefix_matches_primer(r1_prefix, PRIMERS["27F"])
+    if r1_27F:
+        return "V1-V9"
+    # Also check reverse complement of 27F (PacBio reads can be either orientation)
+    r1_27F_rc = _prefix_matches_primer(r1_prefix, _reverse_complement(PRIMERS["27F"]))
+    if r1_27F_rc:
+        return "V1-V9"
+
     r1_515F = _prefix_matches_primer(r1_prefix, PRIMERS["515F"])
     r2_806R = _prefix_matches_primer(r2_prefix, PRIMERS["806R"])
     if r1_515F and r2_806R:
@@ -373,12 +393,15 @@ def detect_variable_region(fastq_path: Path, n_reads: int = 100) -> dict:
             "method": "none", "details": "Could not read sequences from file.",
         }
 
-    # Count primer matches for each region
+    # Read-length heuristic: if average read length > 1000bp, strongly favor V1-V9
+    avg_len = sum(len(s) for s in sequences) / len(sequences) if sequences else 0
+
+    # Count primer matches for each region (forward direction)
     region_primers = {
         "V4": PRIMERS["515F"],
         "V3-V4": "CCTACGGGNGGCWGCAG",
         "V4-V5": PRIMERS["515F"],
-        "V1-V9": "AGAGTTTGATCMTGGCTCAG",
+        "V1-V9": PRIMERS["27F"],
     }
 
     region_scores = defaultdict(int)
@@ -386,6 +409,22 @@ def detect_variable_region(fastq_path: Path, n_reads: int = 100) -> dict:
         for region_name, primer in region_primers.items():
             if _primer_matches(seq, primer):
                 region_scores[region_name] += 1
+        # Also check reverse complement of 27F (PacBio reads can be either orientation)
+        rc_27f = _reverse_complement(PRIMERS["27F"])
+        if _primer_matches(seq, rc_27f):
+            region_scores["V1-V9"] += 1
+
+    # Apply read-length bonus for V1-V9 when reads are long
+    if avg_len > 1000 and "V1-V9" in region_scores:
+        region_scores["V1-V9"] += len(sequences)
+    elif avg_len > 1000 and not region_scores:
+        # Long reads but no primer matches — likely V1-V9 with trimmed primers
+        return {
+            "region": "V1-V9",
+            "confidence": 0.6,
+            "method": "read_length_heuristic",
+            "details": f"Avg read length {avg_len:.0f}bp suggests full-length 16S (V1-V9).",
+        }
 
     if not region_scores:
         # Fallback: BBMap alignment

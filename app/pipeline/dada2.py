@@ -27,6 +27,12 @@ def run_dada2(
     threads: int,
     logger: logging.Logger,
     proc_callback: Callable[[subprocess.Popen], None] | None = None,
+    error_model: str = "default",
+    band_size: int = 16,
+    homopolymer_gap_penalty: int = 0,
+    max_ee: float = 5.0,
+    min_len: int = 0,
+    max_len: int = 0,
 ) -> dict:
     """Run DADA2 denoising via the R script.
 
@@ -37,19 +43,35 @@ def run_dada2(
     dada2_dir = output_dir / "dada2"
     dada2_dir.mkdir(parents=True, exist_ok=True)
 
-    mode = "paired" if sequencing_type == "paired-end" else "single"
-    cmd = conda_cmd([
-        "Rscript", str(R_SCRIPTS_DIR / "run_dada2.R"),
-        "--input_dir", str(input_dir),
-        "--output_dir", str(dada2_dir),
-        "--mode", mode,
-        "--trim_left_f", str(trim_left_f),
-        "--trim_left_r", str(trim_left_r),
-        "--trunc_len_f", str(trunc_len_f),
-        "--trunc_len_r", str(trunc_len_r),
-        "--min_overlap", str(min_overlap),
-        "--threads", str(threads),
-    ], env_name=DADA2_ENV_NAME)
+    is_longread = error_model == "PacBio"
+
+    if is_longread:
+        mode = "longread"
+        cmd = conda_cmd([
+            "Rscript", str(R_SCRIPTS_DIR / "run_dada2.R"),
+            "--input_dir", str(input_dir),
+            "--output_dir", str(dada2_dir),
+            "--mode", mode,
+            "--threads", str(threads),
+            "--min_len", str(min_len),
+            "--max_len", str(max_len),
+            "--max_ee", str(int(max_ee)),
+            "--band_size", str(band_size),
+        ], env_name=DADA2_ENV_NAME)
+    else:
+        mode = "paired" if sequencing_type == "paired-end" else "single"
+        cmd = conda_cmd([
+            "Rscript", str(R_SCRIPTS_DIR / "run_dada2.R"),
+            "--input_dir", str(input_dir),
+            "--output_dir", str(dada2_dir),
+            "--mode", mode,
+            "--trim_left_f", str(trim_left_f),
+            "--trim_left_r", str(trim_left_r),
+            "--trunc_len_f", str(trunc_len_f),
+            "--trunc_len_r", str(trunc_len_r),
+            "--min_overlap", str(min_overlap),
+            "--threads", str(threads),
+        ], env_name=DADA2_ENV_NAME)
 
     logger.info(f"Running DADA2 ({mode} mode)...")
 

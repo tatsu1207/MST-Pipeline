@@ -13,7 +13,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from app.config import DADA2_DEFAULTS, DATASET_DIR, MAX_THREADS
+from app.config import DADA2_DEFAULTS, DADA2_LONG_READ_DEFAULTS, DATASET_DIR, MAX_THREADS, is_long_read, to_absolute, to_relative
 
 # Active pipeline threads keyed by dataset_id or "st-{run_id}" or "pathogen-{run_id}"
 _running_pipelines: dict[int | str, threading.Thread] = {}
@@ -143,6 +143,7 @@ def launch_dada2_pipeline(
     file_ids: list[int],
     name: str,
     threads: int | None = None,
+    error_model: str = "default",
 ) -> int:
     """Create a Dataset record and launch DADA2 in a background thread.
 
@@ -184,6 +185,7 @@ def launch_dada2_pipeline(
             variable_region=variable_region,
             trunc_len_f=0,
             trunc_len_r=0,
+            error_model=error_model,
         )
         db.add(dataset)
         db.flush()
@@ -191,7 +193,7 @@ def launch_dada2_pipeline(
 
         output_dir = DATASET_DIR / str(dataset_id)
         output_dir.mkdir(parents=True, exist_ok=True)
-        dataset.pipeline_log_path = str(output_dir / "pipeline.log")
+        dataset.pipeline_log_path = to_relative(output_dir / "pipeline.log")
         db.commit()
     finally:
         db.close()
@@ -246,12 +248,13 @@ def _run_dada2_pipeline(dataset_id: int, file_ids: list[int], threads: int):
         sample_paths = {}
         for ff in fastq_files:
             sname = ff.sample_name
+            abs_path = str(to_absolute(ff.file_path))
             if sname not in sample_paths:
                 sample_paths[sname] = {}
             if ff.read_direction == "R1" or ff.read_direction == "single":
-                sample_paths[sname]["R1"] = ff.file_path
+                sample_paths[sname]["R1"] = abs_path
             elif ff.read_direction == "R2":
-                sample_paths[sname]["R2"] = ff.file_path
+                sample_paths[sname]["R2"] = abs_path
 
         # Step 1: Cutadapt primer trimming
         _check_cancel(dataset_id)
@@ -262,9 +265,10 @@ def _run_dada2_pipeline(dataset_id: int, file_ids: list[int], threads: int):
         fastq_dir = output_dir / "input_fastq"
         fastq_dir.mkdir(parents=True, exist_ok=True)
         for ff in fastq_files:
-            link = fastq_dir / Path(ff.file_path).name
+            abs_fp = to_absolute(ff.file_path)
+            link = fastq_dir / abs_fp.name
             if not link.exists():
-                os.symlink(ff.file_path, link)
+                os.symlink(abs_fp, link)
 
         from app.pipeline.trim import run_cutadapt
         trim_result = run_cutadapt(
@@ -287,14 +291,24 @@ def _run_dada2_pipeline(dataset_id: int, file_ids: list[int], threads: int):
         from app.pipeline.quality import detect_truncation_params
         trimmed_dir = Path(trim_dir)
 
-        min_overlap = DADA2_DEFAULTS["min_overlap"]
-        trim_left_f = DADA2_DEFAULTS["trim_left_f"]
-        trim_left_r = DADA2_DEFAULTS["trim_left_r"]
+        # Select defaults based on long-read vs short-read mode
+        variable_region = dataset.variable_region
+        if is_long_read(variable_region):
+            defaults = DADA2_LONG_READ_DEFAULTS
+            error_model = dataset.error_model or "PacBio"
+            logger.info(f"Long-read mode: error_model={error_model}")
+        else:
+            defaults = DADA2_DEFAULTS
+            error_model = dataset.error_model or "default"
+
+        min_overlap = defaults["min_overlap"]
+        trim_left_f = defaults["trim_left_f"]
+        trim_left_r = defaults["trim_left_r"]
 
         auto = detect_truncation_params(
             trimmed_dir=trimmed_dir,
             sequencing_type=seq_type,
-            variable_region=dataset.variable_region,
+            variable_region=variable_region,
             min_overlap=min_overlap,
             logger=logger,
         )
@@ -319,6 +333,13 @@ def _run_dada2_pipeline(dataset_id: int, file_ids: list[int], threads: int):
 
         from app.pipeline.dada2 import run_dada2
 
+        # Long-read specific DADA2 parameters
+        band_size = defaults.get("band_size", 16)
+        homopolymer_gap_penalty = defaults.get("homopolymer_gap_penalty", 0)
+        max_ee = defaults.get("max_ee", 5.0)
+        min_len = defaults.get("min_len", 0)
+        max_len = defaults.get("max_len", 0)
+
         dada2_result = run_dada2(
             input_dir=trimmed_dir,
             output_dir=output_dir,
@@ -331,6 +352,12 @@ def _run_dada2_pipeline(dataset_id: int, file_ids: list[int], threads: int):
             threads=threads,
             logger=logger,
             proc_callback=lambda proc: _active_procs.__setitem__(dataset_id, proc),
+            error_model=error_model,
+            band_size=band_size,
+            homopolymer_gap_penalty=homopolymer_gap_penalty,
+            max_ee=max_ee,
+            min_len=min_len,
+            max_len=max_len,
         )
 
         _check_cancel(dataset_id)
@@ -370,7 +397,7 @@ def _run_dada2_pipeline(dataset_id: int, file_ids: list[int], threads: int):
                 read_count_filtered=track.get("filtered"),
                 read_count_nonchimeric=track.get("nonchim"),
                 asv_count=len(col_nonzero),
-                asv_table_path=str(sample_path),
+                asv_table_path=to_relative(sample_path),
             )
             db.add(sample)
 
@@ -465,7 +492,7 @@ def launch_sourcetracker_run(
 
         run_dir = DATASET_DIR / f"st_{run_id}"
         run_dir.mkdir(parents=True, exist_ok=True)
-        run.output_dir = str(run_dir)
+        run.output_dir = to_relative(run_dir)
         db.commit()
     finally:
         db.close()
@@ -554,6 +581,7 @@ def _run_sourcetracker(run_id: int, sample_table_paths: list[str], threads: int 
         from app.pipeline.sourcetracker import (
             load_csv_gz, load_fasta, load_design,
             align_features, collapse_by_group, run_gibbs_subprocess,
+            extract_v4_from_full_length,
         )
         from app.config import SOURCE_TABLE, SOURCE_FASTA, SOURCE_DESIGN
 
@@ -563,6 +591,18 @@ def _run_sourcetracker(run_id: int, sample_table_paths: list[str], threads: int 
         dfs = [load_csv_gz(p) for p in sample_table_paths]
         sink_df = pd.concat(dfs, axis=1).fillna(0).astype(int)
         logger.info(f"  Merged {len(sample_table_paths)} sample tables → {sink_df.shape[0]} ASVs x {sink_df.shape[1]} samples")
+
+        # If the dataset used full-length 16S, extract V4 sub-region before alignment
+        from app.db.models import Dataset
+        dataset_vregion = None
+        if run.dataset_id:
+            ds = db.query(Dataset).filter(Dataset.id == run.dataset_id).first()
+            if ds:
+                dataset_vregion = ds.variable_region
+        if is_long_read(dataset_vregion):
+            logger.info("Full-length 16S detected — extracting V4 sub-region for source alignment...")
+            _update_status(run_dir, "v4_extraction", 10, [])
+            sink_df = extract_v4_from_full_length(sink_df, logger=logger)
 
         source_df = load_csv_gz(str(SOURCE_TABLE))
         db_fasta = load_fasta(str(SOURCE_FASTA))
@@ -602,8 +642,8 @@ def _run_sourcetracker(run_id: int, sample_table_paths: list[str], threads: int 
         mp.to_csv(run_dir / "proportions.csv")
         mps.to_csv(run_dir / "stds.csv")
 
-        run.proportions_path = str(run_dir / "proportions.csv")
-        run.stds_path = str(run_dir / "stds.csv")
+        run.proportions_path = to_relative(run_dir / "proportions.csv")
+        run.stds_path = to_relative(run_dir / "stds.csv")
         run.status = "complete"
         db.commit()
 
@@ -664,7 +704,7 @@ def launch_pathogen_run(
 
         run_dir = DATASET_DIR / f"pathogen_{run_id}"
         run_dir.mkdir(parents=True, exist_ok=True)
-        run.output_dir = str(run_dir)
+        run.output_dir = to_relative(run_dir)
         db.commit()
     finally:
         db.close()

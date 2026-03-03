@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.config import to_absolute
 from app.db.database import get_db
 from app.db.models import Dataset, Sample
 from app.pipeline.runner import (
@@ -26,6 +27,7 @@ class Dada2LaunchRequest(BaseModel):
     upload_id: int
     name: str = "DADA2 Run"
     threads: int | None = None
+    error_model: str = "default"
 
 
 @router.post("/dada2/launch")
@@ -35,6 +37,7 @@ def launch_dada2(req: Dada2LaunchRequest, db: Session = Depends(get_db)):
         upload_id=req.upload_id,
         name=req.name,
         threads=req.threads,
+        error_model=req.error_model,
     )
     return {"dataset_id": dataset_id, "status": "launched"}
 
@@ -94,7 +97,7 @@ def launch_st(req: SourcetrackerLaunchRequest, db: Session = Depends(get_db)):
     if req.sample_names:
         query = query.filter(Sample.sample_name.in_(req.sample_names))
     samples = query.all()
-    paths = [s.asv_table_path for s in samples]
+    paths = [str(to_absolute(s.asv_table_path)) for s in samples]
     if not paths:
         return {"error": "No per-sample ASV tables found for the given dataset/samples"}
 
@@ -150,7 +153,7 @@ def launch_path(req: PathogenLaunchRequest, db: Session = Depends(get_db)):
     if req.sample_names:
         query = query.filter(Sample.sample_name.in_(req.sample_names))
     samples = query.all()
-    paths = [s.asv_table_path for s in samples]
+    paths = [str(to_absolute(s.asv_table_path)) for s in samples]
     if not paths:
         return {"error": "No per-sample ASV tables found for the given dataset/samples"}
 

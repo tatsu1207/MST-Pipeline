@@ -59,8 +59,41 @@ TRUNC_DEFAULTS = {
     ("v45", 300): (200, 100),
 }
 
-VREGION_TAG = {"V4": "v4", "V3-V4": "v34", "V4-V5": "v45"}
+DADA2_LONG_READ_DEFAULTS = {
+    "trim_left_f": 0, "trim_left_r": 0,
+    "trunc_len_f": 0, "trunc_len_r": 0,  # no truncation
+    "min_overlap": 20,
+    "max_ee": 10, "min_len": 1000, "max_len": 1600,
+    "band_size": 32, "homopolymer_gap_penalty": -1,
+}
+
+
+def is_long_read(variable_region: str | None) -> bool:
+    """Return True when variable_region indicates full-length 16S (V1-V9)."""
+    return variable_region == "V1-V9"
+
+
+VREGION_TAG = {"V4": "v4", "V3-V4": "v34", "V4-V5": "v45", "V1-V9": "v19"}
 VALID_V4_REGIONS = {"V4", "V3-V4", "V4-V5", "V1-V9"}
+
+
+def to_relative(abs_path: str | Path) -> str:
+    """Convert an absolute path to a path relative to PROJECT_DIR for DB storage."""
+    try:
+        return str(Path(abs_path).relative_to(PROJECT_DIR))
+    except ValueError:
+        return str(abs_path)
+
+
+def to_absolute(rel_path: str | None) -> Path | None:
+    """Resolve a DB-stored path (relative or legacy absolute) to an absolute Path."""
+    if not rel_path:
+        return None
+    p = Path(rel_path)
+    if p.is_absolute():
+        return p  # legacy absolute path — use as-is
+    return PROJECT_DIR / p
+
 
 # --- Server ---
 HOST = "0.0.0.0"

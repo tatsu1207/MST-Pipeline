@@ -12,6 +12,7 @@ import gzip
 import logging
 from pathlib import Path
 
+from app.config import is_long_read
 from app.pipeline.detect import REGION_PRIMERS, detect_sequencing_type
 
 # Absolute floor — never truncate shorter than this
@@ -46,6 +47,11 @@ def detect_truncation_params(
     Returns dict with: trunc_len_f, trunc_len_r, details (str)
     """
     log = logger or logging.getLogger(__name__)
+
+    # Long-read mode: no truncation needed
+    if is_long_read(variable_region):
+        log.info("Long-read mode: skipping truncation (reads processed at full length)")
+        return {"trunc_len_f": 0, "trunc_len_r": 0, "details": "Long-read mode: no truncation"}
 
     # Find FASTQ files
     all_fastq = sorted(trimmed_dir.glob("*.fastq.gz")) + sorted(

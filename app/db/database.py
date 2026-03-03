@@ -57,3 +57,9 @@ def init_db():
         if "asv_count" not in cols:
             conn.execute(text("ALTER TABLE samples ADD COLUMN asv_count INTEGER"))
             conn.commit()
+
+        # Add error_model column to datasets if missing (long-read support)
+        ds_cols = [r[1] for r in conn.execute(text("PRAGMA table_info(datasets)")).fetchall()]
+        if "error_model" not in ds_cols:
+            conn.execute(text("ALTER TABLE datasets ADD COLUMN error_model VARCHAR"))
+            conn.commit()

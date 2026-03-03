@@ -15,7 +15,7 @@ import dash_uploader as du
 import plotly.graph_objects as go
 from dash import ALL, Input, Output, State, ctx, dcc, html, no_update, dash_table
 
-from app.config import UPLOAD_DIR
+from app.config import UPLOAD_DIR, to_absolute, to_relative
 from app.dashboard.app import app as dash_app
 from app.db.database import SessionLocal
 from app.db.models import FastqFile, Upload
@@ -195,6 +195,24 @@ def get_layout():
                                             ),
                                         ],
                                         width=5,
+                                    ),
+                                    dbc.Col(
+                                        html.Div(
+                                            [
+                                                dbc.Label("Error Model", className="fw-bold"),
+                                                dbc.Select(
+                                                    id="input-error-model",
+                                                    options=[
+                                                        {"label": "Default (short reads)", "value": "default"},
+                                                        {"label": "PacBio HiFi / CCS", "value": "PacBio"},
+                                                    ],
+                                                    value="default",
+                                                ),
+                                            ],
+                                            id="error-model-container",
+                                            style={"display": "none"},
+                                        ),
+                                        width=3,
                                     ),
                                     dbc.Col(
                                         dbc.Button(
@@ -1097,7 +1115,7 @@ def on_register_upload(n_clicks, du_upload_id, trigger):
                     upload_id=upload.id,
                     sample_name=sample_name,
                     filename=filename,
-                    file_path=str(fpath),
+                    file_path=to_relative(fpath),
                     read_direction=read_direction,
                     file_size_mb=round(fpath.stat().st_size / (1024 * 1024), 2),
                     read_count=n_reads,
@@ -1277,8 +1295,9 @@ def on_delete_confirmed(submit_n_clicks, checked, trigger):
         affected_upload_ids = set()
         for ff in fastq_records:
             affected_upload_ids.add(ff.upload_id)
-            p = Path(ff.file_path)
-            p.unlink(missing_ok=True)
+            p = to_absolute(ff.file_path)
+            if p:
+                p.unlink(missing_ok=True)
             db.delete(ff)
 
         db.flush()
@@ -1312,12 +1331,15 @@ def on_delete_confirmed(submit_n_clicks, checked, trigger):
 @dash_app.callback(
     Output("sample-selection-summary", "children"),
     Output("btn-start-pipeline", "disabled"),
+    Output("error-model-container", "style"),
+    Output("input-error-model", "value"),
     Input("fm-checked-samples", "data"),
     State("file-ids-map-store", "data"),
 )
 def update_selection_summary(checked_samples, file_ids_map):
+    hidden = {"display": "none"}
     if not checked_samples or not file_ids_map:
-        return "", True
+        return "", True, hidden, "default"
 
     from app.db.database import get_session
     from app.db.models import FastqFile as FF, Upload as UL
@@ -1339,7 +1361,7 @@ def update_selection_summary(checked_samples, file_ids_map):
 
     n = len(sample_info)
     if n == 0:
-        return "", True
+        return "", True, hidden, "default"
 
     types = set()
     regions = set()
@@ -1365,8 +1387,10 @@ def update_selection_summary(checked_samples, file_ids_map):
     warnings = []
     if len(types) > 1:
         warnings.append(dbc.Badge("Mixed SE/PE", color="warning", className="me-1"))
+    blocked = False
     if len(regions) > 1:
-        warnings.append(dbc.Badge("Mixed regions", color="warning", className="me-1"))
+        warnings.append(dbc.Badge("Mixed regions — cannot run DADA2", color="danger", className="me-1"))
+        blocked = True
 
     summary = html.Div([
         html.Span(f"{n} sample{'s' if n != 1 else ''} selected  ", className="me-2"),
@@ -1374,7 +1398,12 @@ def update_selection_summary(checked_samples, file_ids_map):
         *warnings,
     ])
 
-    return summary, False
+    # Show error model dropdown when V1-V9 (long-read) is detected
+    has_long_read = "V1-V9" in regions
+    error_model_style = {"display": "block"} if has_long_read else hidden
+    error_model_value = "PacBio" if has_long_read else "default"
+
+    return summary, blocked, error_model_style, error_model_value
 
 
 @dash_app.callback(
@@ -1388,10 +1417,11 @@ def update_selection_summary(checked_samples, file_ids_map):
     State("fm-checked-samples", "data"),
     State("file-ids-map-store", "data"),
     State("input-threads", "value"),
+    State("input-error-model", "value"),
     State("an-checked-history", "data"),
     prevent_initial_call=True,
 )
-def on_start_pipeline(n_clicks, checked_samples, file_ids_map, threads_val, checked_history):
+def on_start_pipeline(n_clicks, checked_samples, file_ids_map, threads_val, error_model_val, checked_history):
     if not n_clicks or not checked_samples or not file_ids_map:
         return no_update, no_update, no_update, no_update, no_update, no_update
 
@@ -1478,23 +1508,34 @@ def on_start_pipeline(n_clicks, checked_samples, file_ids_map, threads_val, chec
         region_str = "Region unknown"
         region_color = "secondary"
 
+    is_v19 = region_str == "V1-V9"
+    if is_v19:
+        trunc_note = f"Long-read mode: no truncation, error model = {error_model_val or 'PacBio'}"
+    else:
+        trunc_note = "Truncation parameters will be auto-detected from quality profiles."
+
     card_items = [
         html.Div([
             dbc.Badge(type_str.upper(), color=type_color, className="me-2 fs-6"),
             dbc.Badge(region_str, color=region_color, className="me-2 fs-6"),
+            dbc.Badge("Long-read", color="info", className="me-2 fs-6") if is_v19 else None,
             html.Span(f"{n_samples} sample(s)  |  {len(all_file_ids)} file(s)"),
         ]),
         html.Small(
-            "Truncation parameters will be auto-detected from quality profiles.",
+            trunc_note,
             className="text-muted d-block mt-2",
         ),
     ]
+    # Filter out None badges
+    card_items[0].children = [c for c in card_items[0].children if c is not None]
     summary_card = dbc.Card(dbc.CardBody(card_items), className="mb-3")
 
     if use_default_threads:
         threads = min(n_samples * 2, max(1, MAX_CPUS - 1))
     else:
         threads = threads_override
+
+    error_model = error_model_val or "default"
 
     from app.pipeline.runner import launch_dada2_pipeline
 
@@ -1503,6 +1544,7 @@ def on_start_pipeline(n_clicks, checked_samples, file_ids_map, threads_val, chec
             file_ids=all_file_ids,
             name=dataset_name,
             threads=threads,
+            error_model=error_model,
         )
     except Exception as e:
         return (
@@ -1834,8 +1876,8 @@ def on_sample_asv_download(n_clicks_list):
     if not sample or not sample.asv_table_path:
         return no_update
 
-    p = Path(sample.asv_table_path)
-    if not p.exists():
+    p = to_absolute(sample.asv_table_path)
+    if not p or not p.exists():
         return no_update
 
     return dcc.send_file(str(p), filename=f"{sample.sample_name}_asv_table.csv.gz")
@@ -1908,8 +1950,8 @@ def on_sample_delete(n_clicks_list, checked_history):
 
         # Delete the sample's csv.gz file
         if sample.asv_table_path:
-            p = Path(sample.asv_table_path)
-            if p.exists():
+            p = to_absolute(sample.asv_table_path)
+            if p and p.exists():
                 p.unlink()
 
         dataset_id = sample.dataset_id
@@ -2051,7 +2093,7 @@ def launch_analysis(n_clicks, checked_history,
                 .filter(Sample.dataset_id == dataset_id, Sample.sample_name.in_(sample_names))
                 .all()
             )
-            sample_table_paths.extend(s.asv_table_path for s in samples if s.asv_table_path)
+            sample_table_paths.extend(str(to_absolute(s.asv_table_path)) for s in samples if s.asv_table_path)
 
     if not sample_table_paths:
         err = dbc.Alert("No per-sample ASV tables found for selected samples.", color="danger")

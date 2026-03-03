@@ -17,6 +17,8 @@ import pandas as pd
 
 from app.config import SOURCE_TABLE, SOURCE_FASTA, SOURCE_DESIGN, ST_CONDA_ENV
 
+from app.pipeline.detect import _iupac_to_regex, PRIMERS
+
 _HERE = Path(__file__).resolve().parent.parent.parent
 _GIBBS_SCRIPT = _HERE / "scripts" / "_run_gibbs.py"
 
@@ -220,6 +222,92 @@ def collapse_by_group(source_aligned: pd.DataFrame, design: dict) -> pd.DataFram
     return pd.DataFrame(
         {g: v for g, v in groups.items()}, index=cols
     ).T
+
+
+# -- V4 extraction from full-length 16S ASVs ----------------------------------
+
+_COMPLEMENT = str.maketrans("ACGTRYMKSWBDHVNacgtryMkswbdhvn",
+                            "TGCAYRKMSWVHDBNtgcayrkmswvhdbn")
+
+
+def _reverse_complement_seq(seq: str) -> str:
+    """Return the reverse complement of an IUPAC sequence."""
+    return seq.translate(_COMPLEMENT)[::-1]
+
+
+def extract_v4_from_full_length(sink_df: pd.DataFrame, logger=None) -> pd.DataFrame:
+    """Extract V4 sub-region from full-length 16S ASV sequences.
+
+    For each ASV sequence >500bp, searches for 515F primer (positions 400-600)
+    and rc(806R) (positions 700-950) using IUPAC regex, then extracts the V4
+    sub-sequence between the primer matches (~250bp).
+
+    Returns a new DataFrame with V4 sequences as index (merges identical V4s).
+    """
+    import logging
+    log = logger or logging.getLogger(__name__)
+
+    primer_515f = PRIMERS["515F"]
+    primer_806r_rc = _reverse_complement_seq(PRIMERS["806R"])
+    pat_515f = re.compile(_iupac_to_regex(primer_515f), re.IGNORECASE)
+    pat_806r_rc = re.compile(_iupac_to_regex(primer_806r_rc), re.IGNORECASE)
+
+    v4_rows = {}  # v4_seq -> Series of counts (accumulated)
+    n_extracted = 0
+    n_short = 0
+    n_no_match = 0
+
+    for asv_seq in sink_df.index:
+        seq = str(asv_seq)
+        if len(seq) <= 500:
+            # Short sequence — keep as-is (already V4-range)
+            n_short += 1
+            if seq in v4_rows:
+                v4_rows[seq] = v4_rows[seq].add(sink_df.loc[asv_seq], fill_value=0)
+            else:
+                v4_rows[seq] = sink_df.loc[asv_seq].copy()
+            continue
+
+        # Search for 515F primer in expected position range (400-600)
+        match_515f = pat_515f.search(seq, 400, min(600, len(seq)))
+        if not match_515f:
+            # Try broader search
+            match_515f = pat_515f.search(seq, 300, min(700, len(seq)))
+
+        # Search for rc(806R) in expected position range (700-950)
+        match_806r = pat_806r_rc.search(seq, 700, min(950, len(seq)))
+        if not match_806r:
+            match_806r = pat_806r_rc.search(seq, 600, min(1050, len(seq)))
+
+        if match_515f and match_806r:
+            # Extract V4 sub-region between primers
+            v4_start = match_515f.end()
+            v4_end = match_806r.start()
+            v4_seq = seq[v4_start:v4_end]
+
+            if 150 <= len(v4_seq) <= 350:
+                n_extracted += 1
+                if v4_seq in v4_rows:
+                    v4_rows[v4_seq] = v4_rows[v4_seq].add(sink_df.loc[asv_seq], fill_value=0)
+                else:
+                    v4_rows[v4_seq] = sink_df.loc[asv_seq].copy()
+                continue
+
+        # Could not extract V4 — skip this ASV
+        n_no_match += 1
+
+    log.info(
+        f"V4 extraction: {n_extracted} extracted, {n_short} short (kept), "
+        f"{n_no_match} unmatched (dropped)"
+    )
+
+    if not v4_rows:
+        raise ValueError("V4 extraction failed: no V4 sub-regions could be extracted from full-length ASVs.")
+
+    result = pd.DataFrame(v4_rows).T.fillna(0).astype(int)
+    result.index.name = sink_df.index.name
+    log.info(f"V4 extraction result: {len(result)} unique V4 ASVs from {len(sink_df)} full-length ASVs")
+    return result
 
 
 # -- Gibbs sampling via ST conda env ------------------------------------------
