@@ -30,11 +30,12 @@ from app.pipeline.detect import (
 
 MAX_CPUS = os.cpu_count() or 1
 
-STEPS = ["cutadapt", "auto_trunc", "dada2", "split_samples"]
+STEPS = ["cutadapt", "auto_trunc", "dada2", "taxonomy", "split_samples"]
 STEP_LABELS = {
     "cutadapt": "Cutadapt",
     "auto_trunc": "Auto-Trunc",
     "dada2": "DADA2",
+    "taxonomy": "Taxonomy",
     "split_samples": "Split Samples",
 }
 
@@ -109,11 +110,64 @@ def get_layout():
                 className="mb-4",
             ),
             # Hidden stores for upload/file management
+            dcc.Store(id="fm-staging-dir", data=None),
             dcc.Store(id="fm-upload-trigger", data=0),
             dcc.Store(id="fm-sort-field", data="sample_name"),
             dcc.Store(id="fm-sort-asc", data=True),
             dcc.Store(id="fm-checked-samples", data=[]),
             dcc.ConfirmDialog(id="fm-confirm-delete", message=""),
+
+            # ── Section A2: Import BIOM File ─────────────────────────────────
+            dbc.Card(
+                [
+                    dbc.CardHeader(html.H5("Import Pre-processed BIOM File", className="mb-0")),
+                    dbc.CardBody(
+                        [
+                            html.P(
+                                "Upload a BIOM file from an external DADA2 run to skip "
+                                "directly to SourceTracker and Pathogen detection.",
+                                className="text-muted small",
+                            ),
+                            dcc.Upload(
+                                id="biom-upload",
+                                children=html.Div([
+                                    "Drag & drop a ",
+                                    html.B(".biom"),
+                                    " file here, or ",
+                                    html.A("click to browse"),
+                                ]),
+                                style={
+                                    "width": "100%",
+                                    "height": "60px",
+                                    "lineHeight": "60px",
+                                    "borderWidth": "1px",
+                                    "borderStyle": "dashed",
+                                    "borderRadius": "5px",
+                                    "textAlign": "center",
+                                    "cursor": "pointer",
+                                },
+                            ),
+                            dbc.Row(
+                                [
+                                    dbc.Col(
+                                        dbc.Input(
+                                            id="biom-name",
+                                            placeholder="Dataset name (optional)",
+                                            value="",
+                                            size="sm",
+                                        ),
+                                        width=4,
+                                        className="mt-2",
+                                    ),
+                                ],
+                            ),
+                            html.Div(id="biom-import-status", className="mt-2"),
+                        ]
+                    ),
+                ],
+                className="mb-4",
+            ),
+            dcc.Store(id="biom-taxonomy-dataset-id"),
 
             # ── Section B: Registered Samples + DADA2 ────────────────────────
             dbc.Card(
@@ -321,6 +375,16 @@ def get_layout():
                                 ),
                                 className="mb-3",
                             ),
+                            # Pathogen Detection (uses pre-computed taxonomy from DADA2)
+                            dbc.Card(dbc.CardBody([
+                                html.H6("Pathogen Detection"),
+                                html.P("Uses taxonomy assigned during DADA2 processing.", className="text-muted small mb-0"),
+                            ]), className="mb-3"),
+                            # Hidden inputs to keep callbacks happy
+                            html.Div([
+                                dbc.Input(id="tax-identity", type="hidden", value=97),
+                                dbc.Input(id="tax-threads", type="hidden", value=4),
+                            ], style={"display": "none"}),
                             # Source Tracking params
                             dbc.Card(dbc.CardBody([
                                 html.H6("Source Tracking"),
@@ -372,23 +436,6 @@ def get_layout():
                                     ], md=1),
                                 ]),
                             ]), className="mb-3"),
-                            # Source Tracking progress + results
-                            html.Div(id="st-progress-area", className="mb-3"),
-                            html.Div(id="st-results-area", className="mb-3"),
-                            # Pathogen Detection params
-                            dbc.Card(dbc.CardBody([
-                                html.H6("Pathogen Detection"),
-                                dbc.Row([
-                                    dbc.Col([
-                                        dbc.Label("SILVA Identity (%)", className="small"),
-                                        dbc.Input(id="tax-identity", type="number", value=97, min=90, max=100),
-                                    ], md=3),
-                                    dbc.Col([
-                                        dbc.Label("Threads", className="small"),
-                                        dbc.Input(id="tax-threads", type="number", value=4, min=1),
-                                    ], md=3),
-                                ]),
-                            ]), className="mb-3"),
                             dbc.Button(
                                 "Run Analysis", id="run-analysis-btn",
                                 color="primary", size="lg", className="mb-3",
@@ -396,7 +443,10 @@ def get_layout():
                             ),
                             # Pathogen progress + results
                             html.Div(id="tax-progress-area", className="mb-3"),
-                            html.Div(id="pathogen-results-area"),
+                            html.Div(id="pathogen-results-area", className="mb-3"),
+                            # Source Tracking progress + results
+                            html.Div(id="st-progress-area", className="mb-3"),
+                            html.Div(id="st-results-area"),
                         ]
                     ),
                 ],
@@ -806,10 +856,14 @@ def _build_history_table(checked_history=None):
         filt = f"{s.read_count_filtered:,}" if s.read_count_filtered else "\u2014"
         nonchim = f"{s.read_count_nonchimeric:,}" if s.read_count_nonchimeric else "\u2014"
 
-        status_badge = dbc.Badge(
+        badge = dbc.Badge(
             d.status.upper(),
             color=badge_color.get(d.status, "secondary"),
         )
+        if d.status == "complete" and not d.taxonomy_path:
+            status_badge = html.Span([badge, dbc.Badge("No taxonomy", color="warning", className="ms-1")])
+        else:
+            status_badge = badge
 
         is_complete = d.status == "complete"
         check_key = f"{d.id}:{s.sample_name}"
@@ -962,52 +1016,89 @@ def _build_history_table(checked_history=None):
 
 
 @du.callback(
-    output=Output("fm-upload-file-status", "children"),
+    output=Output("fm-staging-dir", "data"),
     id="fm-du-upload",
 )
 def on_file_uploaded(file_paths):
     if not file_paths:
         return no_update
     latest = Path(file_paths[0])
-    upload_dir = latest.parent
-    all_files = [
-        f.name for f in sorted(upload_dir.iterdir())
-        if f.is_file() and (f.name.endswith(".fastq.gz") or f.name.endswith(".fq.gz"))
-    ]
-    n = len(all_files)
-    return html.Small(
-        f"{n} file(s) transferred: {', '.join(all_files)}",
-        className="text-success",
-    )
+    return str(latest.parent)
 
 
 @dash_app.callback(
+    Output("fm-upload-file-status", "children"),
     Output("fm-btn-register", "disabled"),
-    Input("fm-upload-file-status", "children"),
+    Output("fm-staging-dir", "data", allow_duplicate=True),
+    Input("fm-staging-dir", "data"),
+    Input("url", "pathname"),
+    prevent_initial_call=True,
 )
-def enable_register_button(status):
-    if status:
-        return False
-    return True
+def update_upload_status(staging_dir, _pathname):
+    # Check stored path first
+    if staging_dir:
+        staging = Path(staging_dir)
+        if staging.exists():
+            all_files = [
+                f.name for f in sorted(staging.iterdir())
+                if f.is_file() and (f.name.endswith(".fastq.gz") or f.name.endswith(".fq.gz"))
+            ]
+            if all_files:
+                n = len(all_files)
+                return (
+                    html.Small(f"{n} file(s) transferred: {', '.join(all_files)}", className="text-success"),
+                    False,
+                    no_update,
+                )
+
+    # Scan for any orphaned staging subdirectory (e.g. after disconnect)
+    for child in UPLOAD_DIR.iterdir():
+        if child.is_dir():
+            fastqs = [
+                f.name for f in sorted(child.iterdir())
+                if f.is_file() and (f.name.endswith(".fastq.gz") or f.name.endswith(".fq.gz"))
+            ]
+            if fastqs:
+                n = len(fastqs)
+                return (
+                    html.Small(f"{n} file(s) ready to register: {', '.join(fastqs)}", className="text-info"),
+                    False,
+                    str(child),
+                )
+
+    return "", True, no_update
 
 
 @dash_app.callback(
     Output("fm-upload-status", "children"),
     Output("fm-upload-trigger", "data"),
+    Output("fm-staging-dir", "data", allow_duplicate=True),
     Output("fm-upload-file-status", "children", allow_duplicate=True),
     Output("fm-btn-register", "disabled", allow_duplicate=True),
     Input("fm-btn-register", "n_clicks"),
-    State("fm-du-upload", "upload_id"),
+    State("fm-staging-dir", "data"),
     State("fm-upload-trigger", "data"),
     prevent_initial_call=True,
 )
-def on_register_upload(n_clicks, du_upload_id, trigger):
-    if not du_upload_id:
-        return dbc.Alert("No upload in progress.", color="warning"), no_update, no_update, no_update
+def on_register_upload(n_clicks, staging_dir_path, trigger):
+    # Find staging directory: use stored path, or scan UPLOAD_DIR for any UUID subdirectory
+    staging_dir = None
+    if staging_dir_path:
+        p = Path(staging_dir_path)
+        if p.exists():
+            staging_dir = p
 
-    staging_dir = UPLOAD_DIR / du_upload_id
-    if not staging_dir.exists():
-        return dbc.Alert("Upload directory not found.", color="danger"), no_update, no_update, no_update
+    if staging_dir is None:
+        # Scan for any staging subdirectory left by dash_uploader
+        for child in UPLOAD_DIR.iterdir():
+            if child.is_dir() and any(
+                f.name.endswith((".fastq.gz", ".fq.gz")) for f in child.iterdir() if f.is_file()
+            ):
+                staging_dir = child
+                break
+
+    if staging_dir is None:
+        return dbc.Alert("No upload in progress.", color="warning"), no_update, no_update, no_update, no_update
 
     staged_files = []
     for fpath in sorted(staging_dir.iterdir()):
@@ -1020,7 +1111,7 @@ def on_register_upload(n_clicks, du_upload_id, trigger):
 
     if not staged_files:
         shutil.rmtree(staging_dir, ignore_errors=True)
-        return dbc.Alert("No FASTQ files found in upload.", color="warning"), no_update, no_update, no_update
+        return dbc.Alert("No FASTQ files found in upload.", color="warning"), no_update, None, no_update, no_update
 
     saved_filenames = [f.name for f in staged_files]
 
@@ -1048,6 +1139,7 @@ def on_register_upload(n_clicks, du_upload_id, trigger):
                 color="danger",
             ),
             no_update,
+            None,
             "",
             True,
         )
@@ -1126,7 +1218,7 @@ def on_register_upload(n_clicks, du_upload_id, trigger):
         db.commit()
     except Exception as e:
         db.rollback()
-        return dbc.Alert(f"Database error: {e}", color="danger"), no_update, no_update, no_update
+        return dbc.Alert(f"Database error: {e}", color="danger"), no_update, None, no_update, no_update
     finally:
         db.close()
 
@@ -1153,6 +1245,7 @@ def on_register_upload(n_clicks, du_upload_id, trigger):
     return (
         dbc.Alert(alert_children, color="success"),
         (trigger or 0) + 1,
+        None,
         "",
         True,
     )
@@ -2045,6 +2138,7 @@ def update_analysis_selection(checked_items):
     Output("tax-poll", "disabled", allow_duplicate=True),
     Output("st-progress-area", "children", allow_duplicate=True),
     Output("tax-progress-area", "children", allow_duplicate=True),
+    Output("biom-taxonomy-dataset-id", "data", allow_duplicate=True),
     Input("run-analysis-btn", "n_clicks"),
     State("an-checked-history", "data"),
     State("st-mode", "value"),
@@ -2064,7 +2158,7 @@ def launch_analysis(n_clicks, checked_history,
                     mode, src_depth, snk_depth, restarts, burnin, draws,
                     group_values, group_ids, st_threads, identity, tax_threads):
     if not n_clicks:
-        return (no_update,) * 6
+        return (no_update,) * 7
 
     from app.pipeline.runner import launch_sourcetracker_run, launch_pathogen_run
     from app.db.database import get_session
@@ -2082,12 +2176,16 @@ def launch_analysis(n_clicks, checked_history,
 
     if not by_dataset:
         err = dbc.Alert("No samples selected. Check samples in Pipeline History above.", color="danger")
-        return no_update, no_update, no_update, no_update, err, err
+        return no_update, no_update, no_update, no_update, err, err, no_update
 
     # Query per-sample ASV table paths across all selected datasets
     with get_session() as db:
         sample_table_paths = []
+        has_taxonomy = True
         for dataset_id, sample_names in by_dataset.items():
+            ds = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+            if ds and not ds.taxonomy_path:
+                has_taxonomy = False
             samples = (
                 db.query(Sample)
                 .filter(Sample.dataset_id == dataset_id, Sample.sample_name.in_(sample_names))
@@ -2097,7 +2195,7 @@ def launch_analysis(n_clicks, checked_history,
 
     if not sample_table_paths:
         err = dbc.Alert("No per-sample ASV tables found for selected samples.", color="danger")
-        return no_update, no_update, no_update, no_update, err, err
+        return no_update, no_update, no_update, no_update, err, err, no_update
 
     # Read checked source groups from pattern-matching checkboxes
     selected_groups = []
@@ -2119,25 +2217,45 @@ def launch_analysis(n_clicks, checked_history,
         threads=st_threads or 4,
     )
 
-    # Launch Pathogen
-    tax_run_id = launch_pathogen_run(
-        sample_table_paths=sample_table_paths,
-        silva_identity=(identity or 97) / 100.0,
-        dataset_id=dataset_id,
-        threads=tax_threads or 4,
-    )
-
     st_progress = dbc.Card(dbc.CardBody([
         html.H6("Source Tracking Running..."),
         dbc.Progress(value=0, striped=True, animated=True),
     ]), className="mb-3")
 
-    tax_progress = dbc.Card(dbc.CardBody([
-        html.H6("Pathogen Detection Running..."),
-        dbc.Progress(value=0, striped=True, animated=True),
-    ]), className="mb-3")
+    # Launch Pathogen only if taxonomy is available
+    if has_taxonomy:
+        tax_run_id = launch_pathogen_run(
+            sample_table_paths=sample_table_paths,
+            silva_identity=(identity or 97) / 100.0,
+            dataset_id=dataset_id,
+            threads=tax_threads or 4,
+        )
+        tax_progress = dbc.Card(dbc.CardBody([
+            html.H6("Pathogen Detection Running..."),
+            dbc.Progress(value=0, striped=True, animated=True),
+        ]), className="mb-3")
+    else:
+        tax_run_id = None
+        tax_progress = dbc.Alert(
+            [
+                html.Strong("Pathogen detection requires taxonomy. "),
+                "Selected dataset has no taxonomy data. ",
+                "Run taxonomy assignment first, then re-run analysis.",
+                html.Br(),
+                dbc.Button(
+                    "Run Taxonomy",
+                    id="btn-run-taxonomy-biom",
+                    color="warning",
+                    size="sm",
+                    className="mt-2",
+                ),
+            ],
+            color="warning",
+            className="mt-2",
+        )
 
-    return st_run_id, tax_run_id, False, False, st_progress, tax_progress
+    biom_tax_ds = dataset_id if not has_taxonomy else no_update
+    return st_run_id, tax_run_id, False, not has_taxonomy, st_progress, tax_progress, biom_tax_ds
 
 
 @dash_app.callback(
@@ -2165,6 +2283,22 @@ def poll_st_status(n_intervals, run_id):
 
         run_dir = DATASET_DIR / f"st_{run_id}"
         mp_path = run_dir / "proportions.csv"
+
+        low_samples = status.get("low_alignment_samples", [])
+        sample_pcts = status.get("sample_alignment_pct", {})
+        warn_banner = None
+        if low_samples:
+            detail_lines = [
+                f"{s}: {sample_pcts.get(s, 0)}% reads retained"
+                for s in low_samples
+            ]
+            warn_banner = dbc.Alert([
+                html.Strong(
+                    f"\u26a0 {len(low_samples)} sample(s) excluded "
+                    f"due to low alignment (<10% reads matched):"
+                ),
+                html.Ul([html.Li(line) for line in detail_lines], className="mb-0 mt-2"),
+            ], color="warning", className="mb-3")
 
         results_area = []
         if mp_path.exists():
@@ -2213,7 +2347,8 @@ def poll_st_status(n_intervals, run_id):
             dbc.Progress(value=100, color="success"),
         ]), className="mb-3")
 
-        return progress, results_area, True
+        combined = [warn_banner, results_area] if warn_banner else [results_area]
+        return progress, html.Div(combined), True
 
     if db_status == "failed":
         log_tail = status.get("log_tail", "")
@@ -2242,14 +2377,27 @@ def poll_st_status(n_intervals, run_id):
     Output("tax-progress-area", "children"),
     Output("pathogen-results-area", "children"),
     Output("tax-poll", "disabled"),
+    Output("pipeline-history-table", "children", allow_duplicate=True),
     Input("tax-poll", "n_intervals"),
     State("tax-run-id", "data"),
+    State("biom-taxonomy-dataset-id", "data"),
+    State("an-checked-history", "data"),
     prevent_initial_call=True,
 )
-def poll_tax_status(n_intervals, run_id):
-    if not run_id:
-        return no_update, no_update, True
+def poll_tax_status(n_intervals, run_id, biom_tax_ds_id, checked_history):
+    # If there's a pathogen run, poll it
+    if run_id:
+        return _poll_pathogen(run_id) + (no_update,)
 
+    # Otherwise, if there's a taxonomy-for-BIOM run, poll that
+    if biom_tax_ds_id:
+        return _poll_biom_taxonomy(biom_tax_ds_id, checked_history)
+
+    return no_update, no_update, True, no_update
+
+
+def _poll_pathogen(run_id):
+    """Poll pathogen detection status. Returns (progress, results, disable_poll)."""
     from app.pipeline.runner import get_pathogen_status
 
     status = get_pathogen_status(run_id)
@@ -2343,3 +2491,139 @@ def poll_tax_status(n_intervals, run_id):
     ]), className="mb-3")
 
     return progress, no_update, False
+
+
+def _poll_biom_taxonomy(dataset_id, checked_history):
+    """Poll taxonomy-for-BIOM status. Returns (progress, results, disable_poll, history)."""
+    from app.pipeline.runner import get_taxonomy_status as _get_tax_status
+
+    status = _get_tax_status(dataset_id)
+    tax_status = status.get("status", "idle")
+    pct = status.get("progress_pct", 0)
+
+    if tax_status == "complete":
+        progress = dbc.Card(dbc.CardBody([
+            html.H6("Taxonomy Assignment Complete", className="text-success"),
+            dbc.Progress(value=100, color="success"),
+            html.P("You can now re-run Analysis to include Pathogen detection.", className="mt-2 small"),
+        ]), className="mb-3")
+        return progress, no_update, True, _build_history_table(checked_history)
+
+    if tax_status == "failed":
+        return (
+            dbc.Alert("Taxonomy assignment failed. Check logs.", color="danger"),
+            no_update, True, no_update,
+        )
+
+    if tax_status == "idle":
+        return no_update, no_update, True, no_update
+
+    progress = dbc.Card(dbc.CardBody([
+        html.H6("Taxonomy Assignment Running..."),
+        dbc.Progress(value=pct, striped=True, animated=True, label=f"{pct}%"),
+        html.P(f"Step: {status.get('current_step', '')}", className="mt-2 text-muted small"),
+    ]), className="mb-3")
+
+    return progress, no_update, False, no_update
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Callbacks — BIOM Import
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@dash_app.callback(
+    Output("biom-import-status", "children"),
+    Output("pipeline-history-table", "children", allow_duplicate=True),
+    Input("biom-upload", "contents"),
+    State("biom-upload", "filename"),
+    State("biom-name", "value"),
+    State("an-checked-history", "data"),
+    prevent_initial_call=True,
+)
+def import_biom_file(contents, filename, name, checked_history):
+    """Handle BIOM file upload and import."""
+    if contents is None:
+        return no_update, no_update
+
+    import base64
+    import tempfile
+
+    from app.pipeline.biom_import import import_biom
+
+    # Decode base64 content
+    try:
+        content_type, content_string = contents.split(",")
+        decoded = base64.b64decode(content_string)
+    except Exception:
+        return dbc.Alert("Failed to decode uploaded file.", color="danger"), no_update
+
+    # Write to temp file
+    suffix = ".biom"
+    if filename and "." in filename:
+        suffix = "." + filename.rsplit(".", 1)[-1]
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(decoded)
+        tmp_path = tmp.name
+
+    try:
+        dataset_name = (name or "").strip() or (filename or "BIOM Import")
+        result = import_biom(tmp_path, name=dataset_name)
+    except Exception as e:
+        Path(tmp_path).unlink(missing_ok=True)
+        return dbc.Alert(f"BIOM import failed: {e}", color="danger"), no_update
+
+    Path(tmp_path).unlink(missing_ok=True)
+
+    tax_note = "Taxonomy found" if result["has_taxonomy"] else "No taxonomy (run Taxonomy before Pathogen detection)"
+    region = result["variable_region"] or "Unknown"
+
+    alert = dbc.Alert(
+        [
+            html.Strong("BIOM import successful! "),
+            html.Br(),
+            f"{result['sample_count']} samples, {result['asv_count']} ASVs, "
+            f"region: {region}. {tax_note}.",
+        ],
+        color="success",
+        dismissable=True,
+    )
+
+    return alert, _build_history_table(checked_history)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Callbacks — Run Taxonomy for BIOM import
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@dash_app.callback(
+    Output("tax-progress-area", "children", allow_duplicate=True),
+    Output("tax-poll", "disabled", allow_duplicate=True),
+    Input("btn-run-taxonomy-biom", "n_clicks"),
+    State("biom-taxonomy-dataset-id", "data"),
+    State("tax-threads", "value"),
+    prevent_initial_call=True,
+)
+def launch_taxonomy_for_biom(n_clicks, dataset_id, tax_threads):
+    """Launch taxonomy assignment for a BIOM-imported dataset."""
+    if not n_clicks or not dataset_id:
+        return no_update, no_update
+
+    from app.pipeline.runner import launch_taxonomy_for_dataset
+
+    try:
+        launch_taxonomy_for_dataset(dataset_id, threads=tax_threads or 4)
+    except ValueError as e:
+        return dbc.Alert(str(e), color="danger"), True
+
+    progress = dbc.Card(dbc.CardBody([
+        html.H6("Taxonomy Assignment Running..."),
+        dbc.Progress(id="biom-tax-progress-bar", value=0, striped=True, animated=True),
+        html.P(id="biom-tax-step-label", className="mt-2 text-muted small"),
+    ]), className="mb-3")
+
+    return progress, False
+
+

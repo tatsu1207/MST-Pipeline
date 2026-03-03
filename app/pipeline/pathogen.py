@@ -64,8 +64,13 @@ def detect(asv_df: pd.DataFrame, seq_to_genus: dict) -> tuple[pd.DataFrame, pd.D
         (count_df, ra_df) — both indexed samples x genera.
         Returns empty DataFrames if no pathogens found.
     """
-    genera = pd.Series(
+    raw_genera = pd.Series(
         [seq_to_genus.get(s) for s in asv_df.index], index=asv_df.index
+    )
+    # SILVA uses qualified names like "Clostridium sensu stricto 1";
+    # match on the first word so they still hit the pathogen list.
+    genera = raw_genera.map(
+        lambda g: g.split()[0] if isinstance(g, str) and g.split()[0] in PATHOGENS else g
     )
     mask = genera.isin(PATHOGENS)
     if not mask.any():

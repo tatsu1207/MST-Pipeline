@@ -362,9 +362,27 @@ def _run_dada2_pipeline(dataset_id: int, file_ids: list[int], threads: int):
 
         _check_cancel(dataset_id)
         completed_steps.append("dada2")
-        _update_status(output_dir, "split_samples", 80, completed_steps)
 
-        # Step 5: Split into per-sample ASV tables
+        # Step 5: Taxonomy assignment
+        _update_status(output_dir, "taxonomy", 65, completed_steps)
+        logger.info("Running taxonomy assignment...")
+
+        from app.pipeline.dada2 import run_taxonomy
+        taxonomy_result = run_taxonomy(
+            asv_table_path=Path(dada2_result["asv_table_path"]),
+            output_dir=output_dir / "dada2",
+            threads=threads,
+            logger=logger,
+            proc_callback=lambda proc: _active_procs.__setitem__(dataset_id, proc),
+        )
+        dataset.taxonomy_path = to_relative(taxonomy_result["taxonomy_path"])
+        db.commit()
+
+        _check_cancel(dataset_id)
+        completed_steps.append("taxonomy")
+        _update_status(output_dir, "split_samples", 85, completed_steps)
+
+        # Step 6: Split into per-sample ASV tables
         logger.info("Splitting ASV table into per-sample files...")
         import pandas as pd
 
@@ -547,6 +565,10 @@ def get_sourcetracker_status(run_id: int) -> dict:
         "current_step": step_info.get("current_step"),
         "progress_pct": step_info.get("progress_pct", 0),
         "log_tail": log_tail,
+        "alignment_matched": step_info.get("alignment_matched"),
+        "alignment_total": step_info.get("alignment_total"),
+        "sample_alignment_pct": step_info.get("sample_alignment_pct", {}),
+        "low_alignment_samples": step_info.get("low_alignment_samples", []),
     }
 
 
@@ -620,12 +642,45 @@ def _run_sourcetracker(run_id: int, sample_table_paths: list[str], threads: int 
         )
         logger.info(f"  Matched {n_m}/{n_t} features")
 
+        # Per-sample read retention after alignment
+        total_before = sink_df.sum(axis=0)          # reads per sample before
+        total_after  = sink_al.sum(axis=1)           # reads per sample after (sink_al is samples x features)
+        sample_pct = {}
+        low_samples = []
+        for sample in total_before.index:
+            before = int(total_before[sample])
+            after  = int(total_after.get(sample, 0))
+            pct = (after / before * 100) if before > 0 else 0
+            sample_pct[sample] = round(pct, 1)
+            logger.info(f"  Alignment — {sample}: {after}/{before} reads retained ({pct:.1f}%)")
+            if pct < 10:
+                low_samples.append(sample)
+
+        if low_samples:
+            logger.warning(
+                f"Low alignment rate for {len(low_samples)} sample(s): "
+                + ", ".join(low_samples)
+                + ". Excluding from Gibbs sampling."
+            )
+            sink_al = sink_al.drop(index=low_samples, errors="ignore")
+
+        if sink_al.empty:
+            raise ValueError(
+                "All samples had <10% read alignment to the source database. "
+                "Cannot run SourceTracker."
+            )
+
+        _update_status(run_dir, "aligning", 30, ["aligning"],
+                       alignment_matched=n_m, alignment_total=n_t,
+                       sample_alignment_pct=sample_pct,
+                       low_alignment_samples=low_samples)
+
         _update_status(run_dir, "collapsing", 35, ["aligning"])
         logger.info("Collapsing by group...")
         src_col = collapse_by_group(src_al, design_filtered)
 
         _update_status(run_dir, "gibbs", 40, ["aligning", "collapsing"])
-        logger.info("Running Gibbs sampling...")
+        logger.info(f"Running Gibbs sampling on {len(sink_al)} sample(s)...")
 
         _check_cancel(key)
         mp, mps = run_gibbs_subprocess(
@@ -647,7 +702,10 @@ def _run_sourcetracker(run_id: int, sample_table_paths: list[str], threads: int 
         run.status = "complete"
         db.commit()
 
-        _update_status(run_dir, "complete", 100, ["aligning", "collapsing", "gibbs"])
+        _update_status(run_dir, "complete", 100, ["aligning", "collapsing", "gibbs"],
+                       alignment_matched=n_m, alignment_total=n_t,
+                       sample_alignment_pct=sample_pct,
+                       low_alignment_samples=low_samples)
         logger.info("SourceTracker completed successfully!")
 
     except PipelineCancelled:
@@ -673,6 +731,189 @@ def _run_sourcetracker(run_id: int, sample_table_paths: list[str], threads: int 
         db.close()
         _running_pipelines.pop(key, None)
         _cancel_events.pop(key, None)
+        logger.handlers.clear()
+
+
+# -- Taxonomy-only Pipeline (for BIOM imports) ---------------------------------
+
+def launch_taxonomy_for_dataset(dataset_id: int, threads: int = 4) -> int:
+    """Launch taxonomy assignment for an existing Dataset that lacks taxonomy.
+
+    Collects all unique ASV sequences from per-sample csv.gz files,
+    writes an asv_table.tsv + rep_seqs.fasta, then runs the taxonomy R script.
+    Returns dataset_id.
+    """
+    from app.db.database import SessionLocal
+    from app.db.models import Dataset, Sample
+
+    db = SessionLocal()
+    try:
+        dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+        if not dataset:
+            raise ValueError(f"Dataset {dataset_id} not found")
+        if dataset.taxonomy_path:
+            raise ValueError(f"Dataset {dataset_id} already has taxonomy")
+        if dataset.status != "complete":
+            raise ValueError(f"Dataset {dataset_id} is not complete (status={dataset.status})")
+
+        samples = (
+            db.query(Sample)
+            .filter(Sample.dataset_id == dataset_id, Sample.asv_table_path.isnot(None))
+            .all()
+        )
+        if not samples:
+            raise ValueError(f"No sample ASV tables found for dataset {dataset_id}")
+
+        sample_paths = [str(to_absolute(s.asv_table_path)) for s in samples]
+    finally:
+        db.close()
+
+    key = f"tax-{dataset_id}"
+    _cancel_events[key] = threading.Event()
+
+    t = threading.Thread(
+        target=_run_taxonomy_for_dataset,
+        args=(dataset_id, sample_paths, threads),
+        daemon=True,
+        name=key,
+    )
+    _running_pipelines[key] = t
+    t.start()
+    return dataset_id
+
+
+def get_taxonomy_status(dataset_id: int) -> dict:
+    """Get current status for a taxonomy-only pipeline."""
+    from app.db.database import SessionLocal
+    from app.db.models import Dataset
+
+    output_dir = DATASET_DIR / str(dataset_id)
+    status_file = output_dir / "taxonomy_status.json"
+
+    step_info = {}
+    if status_file.exists():
+        try:
+            step_info = json.loads(status_file.read_text())
+        except Exception:
+            pass
+
+    db = SessionLocal()
+    try:
+        dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+        has_taxonomy = bool(dataset.taxonomy_path) if dataset else False
+    finally:
+        db.close()
+
+    key = f"tax-{dataset_id}"
+    thread = _running_pipelines.get(key)
+    thread_alive = thread is not None and thread.is_alive()
+
+    status = "idle"
+    if thread_alive:
+        status = "running"
+    elif has_taxonomy:
+        status = "complete"
+    elif step_info.get("current_step") == "failed":
+        status = "failed"
+
+    return {
+        "dataset_id": dataset_id,
+        "status": status,
+        "current_step": step_info.get("current_step"),
+        "progress_pct": step_info.get("progress_pct", 0),
+        "has_taxonomy": has_taxonomy,
+        "thread_alive": thread_alive,
+    }
+
+
+def _run_taxonomy_for_dataset(dataset_id: int, sample_paths: list[str], threads: int):
+    """Run taxonomy assignment in a background thread for an imported dataset."""
+    import pandas as pd
+    from app.db.database import SessionLocal
+    from app.db.models import Dataset
+    from app.pipeline.sourcetracker import load_csv_gz
+
+    output_dir = DATASET_DIR / str(dataset_id)
+    key = f"tax-{dataset_id}"
+
+    logger = logging.getLogger(key)
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    fh = logging.FileHandler(output_dir / "taxonomy.log")
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(fh)
+
+    # Use a separate status file to avoid clobbering DADA2 status.json
+    def _tax_status(step, pct):
+        status_file = output_dir / "taxonomy_status.json"
+        status_file.write_text(json.dumps({
+            "current_step": step,
+            "progress_pct": pct,
+        }))
+
+    db = SessionLocal()
+    try:
+        _tax_status("loading", 10)
+        logger.info(f"Taxonomy pipeline started for dataset {dataset_id}")
+
+        # Load and merge all per-sample csv.gz to collect unique sequences
+        dfs = [load_csv_gz(p) for p in sample_paths]
+        merged = pd.concat(dfs, axis=1).fillna(0).astype(int)
+        sequences = list(merged.index)
+        logger.info(f"Collected {len(sequences)} unique ASV sequences")
+
+        # Write asv_table.tsv + rep_seqs.fasta
+        dada2_dir = output_dir / "dada2"
+        dada2_dir.mkdir(parents=True, exist_ok=True)
+
+        asv_rows = []
+        with open(dada2_dir / "rep_seqs.fasta", "w") as fasta:
+            for i, seq in enumerate(sequences, 1):
+                asv_id = f"ASV_{i}"
+                fasta.write(f">{asv_id}\n{seq}\n")
+                row = {"ASV_ID": asv_id, "sequence": seq}
+                for col in merged.columns:
+                    row[col] = int(merged.loc[seq, col])
+                asv_rows.append(row)
+
+        asv_df = pd.DataFrame(asv_rows)
+        asv_table_path = dada2_dir / "asv_table.tsv"
+        asv_df.to_csv(asv_table_path, sep="\t", index=False)
+        logger.info(f"Wrote {len(sequences)} sequences to {asv_table_path}")
+
+        # Run taxonomy R script
+        _check_cancel(key)
+        _tax_status("taxonomy", 30)
+        logger.info("Running taxonomy assignment...")
+
+        from app.pipeline.dada2 import run_taxonomy
+        taxonomy_result = run_taxonomy(
+            asv_table_path=asv_table_path,
+            output_dir=dada2_dir,
+            threads=threads,
+            logger=logger,
+            proc_callback=lambda proc: _active_procs.__setitem__(key, proc),
+        )
+
+        # Update dataset
+        dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+        dataset.taxonomy_path = to_relative(taxonomy_result["taxonomy_path"])
+        db.commit()
+
+        _tax_status("complete", 100)
+        logger.info("Taxonomy assignment complete!")
+
+    except PipelineCancelled:
+        logger.info("Taxonomy pipeline cancelled.")
+        _tax_status("failed", 0)
+    except Exception as e:
+        logger.error(f"Taxonomy pipeline failed: {e}", exc_info=True)
+        _tax_status("failed", 0)
+    finally:
+        db.close()
+        _running_pipelines.pop(key, None)
+        _cancel_events.pop(key, None)
+        _active_procs.pop(key, None)
         logger.handlers.clear()
 
 
@@ -787,7 +1028,6 @@ def _run_pathogen(run_id: int, sample_table_paths: list[str], threads: int = 4):
         logger.info(f"Pathogen detection run {run_id} started")
 
         from app.pipeline.sourcetracker import load_csv_gz
-        from app.pipeline.taxonomy import classify
         from app.pipeline.pathogen import detect, build_summary
 
         _update_status(run_dir, "loading", 10, [])
@@ -802,11 +1042,43 @@ def _run_pathogen(run_id: int, sample_table_paths: list[str], threads: int = 4):
 
         _check_cancel(key)
         _update_status(run_dir, "classifying", 30, [])
-        logger.info(f"Classifying against SILVA (identity={run.silva_identity})...")
 
-        seq_to_genus = classify(sequences, identity=run.silva_identity, threads=threads)
+        # Load pre-computed taxonomy from DADA2 pipeline
+        from app.db.models import Dataset
+        taxonomy_path = None
+        if run.dataset_id:
+            ds = db.query(Dataset).filter(Dataset.id == run.dataset_id).first()
+            if ds and ds.taxonomy_path:
+                taxonomy_path = to_absolute(ds.taxonomy_path)
+
+        if not taxonomy_path or not taxonomy_path.exists():
+            raise RuntimeError("No taxonomy data found. Please re-run DADA2 for this dataset.")
+
+        logger.info("Loading pre-computed taxonomy...")
+        tax_df = pd.read_csv(taxonomy_path, sep="\t")
+
+        # Build ASV_ID → sequence mapping from rep_seqs.fasta
+        rep_seqs_path = taxonomy_path.parent / "rep_seqs.fasta"
+        asv_to_seq = {}
+        with open(rep_seqs_path) as fh:
+            asv_id = None
+            for line in fh:
+                line = line.strip()
+                if line.startswith(">"):
+                    asv_id = line[1:]
+                elif asv_id:
+                    asv_to_seq[asv_id] = line
+                    asv_id = None
+
+        # Build sequence → genus mapping
+        seq_to_genus = {}
+        for _, row in tax_df.iterrows():
+            seq = asv_to_seq.get(row["ASV_ID"])
+            if seq:
+                genus = row.get("Genus")
+                seq_to_genus[seq] = genus if pd.notna(genus) else None
         n_classified = sum(1 for g in seq_to_genus.values() if g)
-        logger.info(f"Classified {n_classified}/{len(sequences)} ASVs")
+        logger.info(f"Loaded {n_classified}/{len(sequences)} genus assignments")
 
         _check_cancel(key)
         _update_status(run_dir, "detecting", 70, ["classifying"])
