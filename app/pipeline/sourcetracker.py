@@ -162,10 +162,12 @@ def align_features(sink_df, source_df, db_fasta, mode="asv", threads=16):
             avg_sink = sum(sink_lens) / len(sink_lens) if sink_lens else 0
             avg_src = sum(src_lens) / len(src_lens) if src_lens else 0
 
-            identity = 1.0 if mode == "asv" else 0.99
+            _IDENTITY_MAP = {"asv": 1.0, "otu": 0.99, "otu98": 0.98, "otu97": 0.97}
+            identity = _IDENTITY_MAP.get(mode, 1.0)
 
-            if avg_sink > avg_src * 1.3:
-                # Sink seqs are significantly longer than source (e.g. V3-V4 vs V4).
+            if avg_sink > avg_src + 1:
+                # Sink seqs are longer than source (e.g. V3-V4 vs V4, or
+                # a few extra boundary bases like trailing "GG").
                 # Use source as query → sink as db so the shorter source
                 # sequence aligns within the longer sink amplicon.
                 # Relax identity to 0.97 to tolerate minor boundary differences.
@@ -233,6 +235,85 @@ _COMPLEMENT = str.maketrans("ACGTRYMKSWBDHVNacgtryMkswbdhvn",
 def _reverse_complement_seq(seq: str) -> str:
     """Return the reverse complement of an IUPAC sequence."""
     return seq.translate(_COMPLEMENT)[::-1]
+
+
+def extract_v4_region(sink_df: pd.DataFrame, variable_region: str, logger=None) -> pd.DataFrame:
+    """Extract V4 sub-region from non-V4 amplicons.
+
+    For V3-V4: finds 515F primer within each sequence and takes everything after it.
+    For V4-V5: finds RC(806R) primer within each sequence and takes everything before it.
+    For V1-V9: finds both 515F and RC(806R) and extracts the region between them.
+
+    Returns a new DataFrame with V4 sequences as index (merges identical V4s).
+    """
+    import logging
+    log = logger or logging.getLogger(__name__)
+
+    primer_515f = PRIMERS["515F"]
+    primer_806r_rc = _reverse_complement_seq(PRIMERS["806R"])
+    pat_515f = re.compile(_iupac_to_regex(primer_515f), re.IGNORECASE)
+    pat_806r_rc = re.compile(_iupac_to_regex(primer_806r_rc), re.IGNORECASE)
+
+    v4_rows = {}
+    n_extracted = 0
+    n_kept = 0
+    n_no_match = 0
+
+    for asv_seq in sink_df.index:
+        seq = str(asv_seq)
+        v4_seq = None
+
+        if variable_region == "V3-V4":
+            # Primers already removed: seq = [V3][515F site][V4]
+            # Find 515F and take everything after it
+            m = pat_515f.search(seq)
+            if m:
+                v4_seq = seq[m.end():]
+        elif variable_region == "V4-V5":
+            # Primers already removed: seq = [V4][RC(806R) site][V5]
+            # Find RC(806R) and take everything before it
+            m = pat_806r_rc.search(seq)
+            if m:
+                v4_seq = seq[:m.start()]
+        elif variable_region == "V1-V9":
+            # Full-length: find both primers
+            m_f = pat_515f.search(seq, 300, min(700, len(seq)))
+            if not m_f:
+                m_f = pat_515f.search(seq)
+            m_r = pat_806r_rc.search(seq, 600, min(1050, len(seq)))
+            if not m_r:
+                m_r = pat_806r_rc.search(seq)
+            if m_f and m_r:
+                v4_seq = seq[m_f.end():m_r.start()]
+
+        if v4_seq and 150 <= len(v4_seq) <= 350:
+            n_extracted += 1
+            if v4_seq in v4_rows:
+                v4_rows[v4_seq] = v4_rows[v4_seq].add(sink_df.loc[asv_seq], fill_value=0)
+            else:
+                v4_rows[v4_seq] = sink_df.loc[asv_seq].copy()
+        elif v4_seq is None and 150 <= len(seq) <= 350:
+            # No primer found but length is V4-range — keep as-is
+            n_kept += 1
+            if seq in v4_rows:
+                v4_rows[seq] = v4_rows[seq].add(sink_df.loc[asv_seq], fill_value=0)
+            else:
+                v4_rows[seq] = sink_df.loc[asv_seq].copy()
+        else:
+            n_no_match += 1
+
+    log.info(
+        f"V4 extraction: {n_extracted} extracted, {n_kept} kept as-is, "
+        f"{n_no_match} unmatched (dropped)"
+    )
+
+    if not v4_rows:
+        raise ValueError("V4 extraction failed: no V4 sub-regions could be extracted.")
+
+    result = pd.DataFrame(v4_rows).T.fillna(0).astype(int)
+    result.index.name = sink_df.index.name
+    log.info(f"V4 extraction result: {len(result)} unique V4 ASVs from {len(sink_df)} input ASVs")
+    return result
 
 
 def extract_v4_from_full_length(sink_df: pd.DataFrame, logger=None) -> pd.DataFrame:

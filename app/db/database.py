@@ -58,6 +58,12 @@ def init_db():
             conn.execute(text("ALTER TABLE samples ADD COLUMN asv_count INTEGER"))
             conn.commit()
 
+        # Add variable_region column to fastq_files if missing (per-sample region)
+        ff_cols = [r[1] for r in conn.execute(text("PRAGMA table_info(fastq_files)")).fetchall()]
+        if "variable_region" not in ff_cols:
+            conn.execute(text("ALTER TABLE fastq_files ADD COLUMN variable_region VARCHAR"))
+            conn.commit()
+
         # Add error_model column to datasets if missing (long-read support)
         ds_cols = [r[1] for r in conn.execute(text("PRAGMA table_info(datasets)")).fetchall()]
         if "error_model" not in ds_cols:

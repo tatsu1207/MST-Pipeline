@@ -251,6 +251,32 @@ def get_layout():
                                         width=5,
                                     ),
                                     dbc.Col(
+                                        [
+                                            dbc.Label("Trunc R1", className="fw-bold"),
+                                            dbc.Input(
+                                                id="input-trunc-f",
+                                                type="text",
+                                                value="auto",
+                                                placeholder="auto",
+                                                style={"maxWidth": "90px"},
+                                            ),
+                                        ],
+                                        width="auto",
+                                    ),
+                                    dbc.Col(
+                                        [
+                                            dbc.Label("Trunc R2", className="fw-bold"),
+                                            dbc.Input(
+                                                id="input-trunc-r",
+                                                type="text",
+                                                value="auto",
+                                                placeholder="auto",
+                                                style={"maxWidth": "90px"},
+                                            ),
+                                        ],
+                                        width="auto",
+                                    ),
+                                    dbc.Col(
                                         html.Div(
                                             [
                                                 dbc.Label("Error Model", className="fw-bold"),
@@ -378,7 +404,15 @@ def get_layout():
                             # Pathogen Detection (uses pre-computed taxonomy from DADA2)
                             dbc.Card(dbc.CardBody([
                                 html.H6("Pathogen Detection"),
-                                html.P("Uses taxonomy assigned during DADA2 processing.", className="text-muted small mb-0"),
+                                html.P("Uses taxonomy assigned during DADA2 processing.", className="text-muted small mb-2"),
+                                html.Details([
+                                    html.Summary("Target pathogen list", className="small text-muted", style={"cursor": "pointer"}),
+                                    html.Div(
+                                        _build_pathogen_list(),
+                                        className="mt-1",
+                                        style={"maxHeight": "220px", "overflowY": "auto", "fontSize": "0.78rem"},
+                                    ),
+                                ]),
                             ]), className="mb-3"),
                             # Hidden inputs to keep callbacks happy
                             html.Div([
@@ -406,6 +440,8 @@ def get_layout():
                                             options=[
                                                 {"label": "ASV (100%)", "value": "asv"},
                                                 {"label": "OTU (99%)", "value": "otu"},
+                                                {"label": "OTU (98%)", "value": "otu98"},
+                                                {"label": "OTU (97%)", "value": "otu97"},
                                             ],
                                             value="asv",
                                         ),
@@ -510,6 +546,70 @@ def _avg_read_length(fastq_path: Path, n_reads: int = 200) -> int | None:
         return None
 
 
+def _quality_trunc(fastq_path: Path, n_reads: int = 2000, q_threshold: int = 20) -> int | None:
+    """Find where per-base mean quality drops below Q20 (10bp sliding window).
+
+    Scans from the end of the read backward. Returns the last position
+    where a 10bp window has mean quality >= q_threshold.
+    """
+    import gzip
+    try:
+        opener = gzip.open if str(fastq_path).endswith(".gz") else open
+        # Count total reads
+        total = 0
+        with opener(fastq_path, "rt") as f:
+            for _ in f:
+                total += 1
+        total = total // 4
+        if total == 0:
+            return None
+        stride = max(1, total // n_reads)
+        # Sample quality scores evenly
+        scores = []
+        with opener(fastq_path, "rt") as f:
+            read_idx = 0
+            line_num = 0
+            for line in f:
+                line_num += 1
+                if line_num % 4 == 0:
+                    if read_idx % stride == 0:
+                        qual = line.rstrip()
+                        scores.append([ord(c) - 33 for c in qual])
+                        if len(scores) >= n_reads:
+                            break
+                    read_idx += 1
+        if not scores:
+            return None
+        # Compute per-position mean quality
+        max_len = max(len(s) for s in scores)
+        mean_qual = []
+        for pos in range(max_len):
+            quals = [s[pos] for s in scores if pos < len(s)]
+            mean_qual.append(sum(quals) / len(quals) if quals else 0)
+        # Scan backward with 10bp sliding window
+        window = 10
+        for pos in range(max_len - 1, window - 2, -1):
+            start = max(0, pos - window + 1)
+            win_mean = sum(mean_qual[start:pos + 1]) / (pos + 1 - start)
+            if win_mean >= q_threshold:
+                return pos + 1
+        return 100
+    except Exception:
+        return None
+
+
+def _region_with_insert(region: str | None) -> str:
+    """Format region name with expected insert length (without primers)."""
+    if not region or region not in REGION_PRIMERS:
+        return region or "\u2014"
+    info = REGION_PRIMERS[region]
+    lo, hi = info["expected_len"]
+    fwd_len = len(info.get("forward", ""))
+    rev_len = len(info.get("reverse", ""))
+    insert = (lo + hi) // 2 - fwd_len - rev_len
+    return f"{region} ({insert}bp)"
+
+
 def _build_files_table(sort_by="sample_name", filters=None, ascending=True, checked_samples=None):
     """Build a sample-level table of all registered FASTQ files.
 
@@ -522,7 +622,7 @@ def _build_files_table(sort_by="sample_name", filters=None, ascending=True, chec
     db = SessionLocal()
     try:
         query = (
-            db.query(FastqFile, Upload.created_at, Upload.variable_region, Upload.primers_detected)
+            db.query(FastqFile, Upload.created_at, Upload.primers_detected)
             .join(Upload, FastqFile.upload_id == Upload.id)
         )
 
@@ -534,15 +634,18 @@ def _build_files_table(sort_by="sample_name", filters=None, ascending=True, chec
             "files": [], "total_size": 0.0, "date": None,
             "region": None, "upload_id": None, "primers_detected": None,
         })
-        for f, upload_date, region, primers_detected in results:
+        for f, upload_date, primers_detected in results:
             s = sample_map[f.sample_name]
             s["files"].append(f)
             s["total_size"] += f.file_size_mb or 0
             s["upload_id"] = f.upload_id
             if upload_date:
                 s["date"] = upload_date
-            if region:
-                s["region"] = region
+            # Prefer per-file region; fall back to upload-level region
+            if f.variable_region:
+                s["region"] = f.variable_region
+            elif not s["region"]:
+                s["region"] = f.upload.variable_region if f.upload else None
             if primers_detected is not None:
                 s["primers_detected"] = primers_detected
 
@@ -560,8 +663,16 @@ def _build_files_table(sort_by="sample_name", filters=None, ascending=True, chec
                 direction = ", ".join(sorted(directions))
 
             total_reads = sum(f.read_count or 0 for f in files)
+            # For PE data, show read pairs (not R1+R2 total)
+            if direction == "PE":
+                total_reads = total_reads // 2
             avg_lengths = [f.avg_read_length for f in files if f.avg_read_length]
             avg_len = round(sum(avg_lengths) / len(avg_lengths)) if avg_lengths else None
+
+            # Quality truncation per direction
+            qt_r1 = next((f.quality_trunc for f in files if f.read_direction == "R1" and f.quality_trunc), None)
+            qt_r2 = next((f.quality_trunc for f in files if f.read_direction == "R2" and f.quality_trunc), None)
+            qt_se = next((f.quality_trunc for f in files if f.read_direction == "single" and f.quality_trunc), None)
 
             sample_rows.append({
                 "sample_name": sample_name,
@@ -569,6 +680,9 @@ def _build_files_table(sort_by="sample_name", filters=None, ascending=True, chec
                 "total_reads": total_reads,
                 "region": info["region"],
                 "avg_len": avg_len,
+                "qt_r1": qt_r1,
+                "qt_r2": qt_r2,
+                "qt_se": qt_se,
                 "date": info["date"],
                 "n_files": len(files),
                 "primers_detected": info["primers_detected"],
@@ -616,6 +730,16 @@ def _build_files_table(sort_by="sample_name", filters=None, ascending=True, chec
                 primers_badge = dbc.Badge("No", color="info")
             else:
                 primers_badge = dbc.Badge("?", color="secondary")
+            # Quality truncation display
+            if r["direction"] == "PE":
+                r1_str = f"R1:{r['qt_r1']}" if r["qt_r1"] else "R1:—"
+                r2_str = f"R2:{r['qt_r2']}" if r["qt_r2"] else "R2:—"
+                qt_str = f"{r1_str} {r2_str}"
+            elif r["qt_se"]:
+                qt_str = str(r["qt_se"])
+            else:
+                qt_str = "\u2014"
+
             rows.append(
                 html.Tr(
                     [
@@ -634,9 +758,10 @@ def _build_files_table(sort_by="sample_name", filters=None, ascending=True, chec
                             )
                         ),
                         html.Td(reads_str),
-                        html.Td(r["region"] or "\u2014", className="small"),
+                        html.Td(_region_with_insert(r["region"]), className="small"),
                         html.Td(primers_badge),
                         html.Td(f"{r['avg_len']} bp" if r["avg_len"] else "\u2014", className="small"),
+                        html.Td(qt_str, className="small"),
                         html.Td(date_str, className="text-muted small"),
                     ]
                 )
@@ -653,7 +778,7 @@ def _build_files_table(sort_by="sample_name", filters=None, ascending=True, chec
         table_div = html.Div(
             [
                 html.P(
-                    f"{len(sample_rows)} samples, {total_files} files, {total_reads:,} reads total",
+                    f"{len(sample_rows)} samples, {total_files} files, {total_reads:,} read pairs total",
                     className="text-muted mb-2",
                 ),
                 dbc.Table(
@@ -671,6 +796,7 @@ def _build_files_table(sort_by="sample_name", filters=None, ascending=True, chec
                                     _th("Region", "region"),
                                     html.Th("Primers"),
                                     _th("Avg Read Len", "avg_read_length"),
+                                    html.Th("Q20 Trunc", title="Recommended truncation length (≥50% reads pass EE≤5)"),
                                     _th("Date", "created_at"),
                                 ]
                             )
@@ -754,6 +880,32 @@ def _get_source_db_stats():
         "total_asvs": source_df.shape[0],
         "total_samples": sum(len(v) for v in group_samples.values()),
     }
+
+
+def _build_pathogen_list():
+    """Build a grouped list of target pathogens for display."""
+    from app.pipeline.pathogen import PATHOGENS, _PRIORITY_LABELS, _PRIORITY_ORDER
+    from collections import defaultdict
+    by_priority = defaultdict(list)
+    for genus, priority in PATHOGENS.items():
+        by_priority[priority].append(genus)
+    items = []
+    colors = {"critical": "#e53935", "high": "#f57c00", "medium": "#f9a825", "other": "#1976d2"}
+    for p in _PRIORITY_ORDER:
+        genera = by_priority.get(p, [])
+        if not genera:
+            continue
+        items.append(html.Div([
+            html.Span(
+                f"{_PRIORITY_LABELS[p]} ({len(genera)})",
+                style={"color": colors.get(p, "#666"), "fontWeight": "600"},
+            ),
+            html.Span(
+                " — " + ", ".join(genera),
+                className="text-muted",
+            ),
+        ], className="mb-1"))
+    return html.Div(items)
 
 
 def _build_source_db_info(stats):
@@ -1153,26 +1305,45 @@ def on_register_upload(n_clicks, staging_dir_path, trigger):
 
     detection = detect_sequencing_type(saved_filenames)
 
-    variable_region = None
-    first_sample = next(iter(detection["samples"].values()), {})
-    r1_name = first_sample.get("R1")
-    if r1_name:
-        try:
-            region_result = detect_variable_region(UPLOAD_DIR / r1_name)
-            variable_region = region_result["region"]
-        except Exception:
-            pass
+    # Detect variable region per-sample (from each R1 / SE file)
+    from collections import Counter as _Counter
+    sample_region_map = {}  # sample_name -> region
+    for _sname, _sinfo in detection["samples"].items():
+        _r1 = _sinfo.get("R1")
+        if _r1:
+            try:
+                _r2 = _sinfo.get("R2")
+                _r2_path = (UPLOAD_DIR / _r2) if _r2 else None
+                _res = detect_variable_region(UPLOAD_DIR / _r1, r2_path=_r2_path)
+                if _res["region"]:
+                    sample_region_map[_sname] = _res["region"]
+            except Exception:
+                pass
+
+    # Upload-level region = majority (for backward compatibility / display)
+    if sample_region_map:
+        _region_counts = _Counter(sample_region_map.values())
+        variable_region = _region_counts.most_common(1)[0][0]
+    else:
+        variable_region = None
 
     primers_detected = None
-    if variable_region and r1_name:
-        try:
-            fwd_primer = REGION_PRIMERS[variable_region]["forward"]
-            seqs = _read_fastq_sequences(UPLOAD_DIR / r1_name, n_reads=100)
-            if seqs:
-                matches = sum(1 for s in seqs if _primer_matches(s, fwd_primer))
-                primers_detected = (matches / len(seqs)) >= 0.30
-        except Exception:
-            pass
+    if variable_region:
+        # Check primer presence using first R1 that matched the majority region
+        _check_file = None
+        for _sname, _sinfo in detection["samples"].items():
+            if sample_region_map.get(_sname) == variable_region and _sinfo.get("R1"):
+                _check_file = _sinfo["R1"]
+                break
+        if _check_file:
+            try:
+                fwd_primer = REGION_PRIMERS[variable_region]["forward"]
+                seqs = _read_fastq_sequences(UPLOAD_DIR / _check_file, n_reads=100)
+                if seqs:
+                    matches = sum(1 for s in seqs if _primer_matches(s, fwd_primer))
+                    primers_detected = (matches / len(seqs)) >= 0.30
+            except Exception:
+                pass
 
     db = SessionLocal()
     try:
@@ -1202,6 +1373,7 @@ def on_register_upload(n_clicks, staging_dir_path, trigger):
             fpath = UPLOAD_DIR / filename
             avg_len = _avg_read_length(fpath)
             n_reads = _count_reads(fpath)
+            q_trunc = _quality_trunc(fpath)
             db.add(
                 FastqFile(
                     upload_id=upload.id,
@@ -1209,9 +1381,11 @@ def on_register_upload(n_clicks, staging_dir_path, trigger):
                     filename=filename,
                     file_path=to_relative(fpath),
                     read_direction=read_direction,
+                    variable_region=sample_region_map.get(sample_name),
                     file_size_mb=round(fpath.stat().st_size / (1024 * 1024), 2),
                     read_count=n_reads,
                     avg_read_length=avg_len,
+                    quality_trunc=q_trunc,
                 )
             )
 
@@ -1234,6 +1408,13 @@ def on_register_upload(n_clicks, staging_dir_path, trigger):
         f"({_human_size(total_size)}), {detection['type']}{region_str}{primer_str}"
     )
     warnings = detection.get("errors", [])
+    # Warn about mixed variable regions
+    unique_regions = set(sample_region_map.values())
+    if len(unique_regions) > 1:
+        warnings.append(
+            f"Mixed variable regions detected ({', '.join(sorted(unique_regions))}). "
+            "Select only same-region samples when running DADA2."
+        )
     alert_children = [html.P(msg, className="mb-0")]
     if warnings:
         alert_children.append(
@@ -1446,11 +1627,14 @@ def update_selection_summary(checked_samples, file_ids_map):
         )
 
     sample_info = defaultdict(lambda: {"directions": set(), "region": None})
-    for f, region in results:
+    for f, upload_region in results:
         s = sample_info[f.sample_name]
         s["directions"].add(f.read_direction)
-        if region:
-            s["region"] = region
+        # Prefer per-file region; fall back to upload-level
+        if f.variable_region:
+            s["region"] = f.variable_region
+        elif upload_region and not s["region"]:
+            s["region"] = upload_region
 
     n = len(sample_info)
     if n == 0:
@@ -1510,11 +1694,13 @@ def update_selection_summary(checked_samples, file_ids_map):
     State("fm-checked-samples", "data"),
     State("file-ids-map-store", "data"),
     State("input-threads", "value"),
+    State("input-trunc-f", "value"),
+    State("input-trunc-r", "value"),
     State("input-error-model", "value"),
     State("an-checked-history", "data"),
     prevent_initial_call=True,
 )
-def on_start_pipeline(n_clicks, checked_samples, file_ids_map, threads_val, error_model_val, checked_history):
+def on_start_pipeline(n_clicks, checked_samples, file_ids_map, threads_val, trunc_f_val, trunc_r_val, error_model_val, checked_history):
     if not n_clicks or not checked_samples or not file_ids_map:
         return no_update, no_update, no_update, no_update, no_update, no_update
 
@@ -1535,6 +1721,26 @@ def on_start_pipeline(n_clicks, checked_samples, file_ids_map, threads_val, erro
                 ),
                 no_update, no_update,
             )
+
+    # Parse truncation overrides
+    trunc_f_override = None
+    trunc_r_override = None
+    for label, val, setter in [("Trunc R1", trunc_f_val, "f"), ("Trunc R2", trunc_r_val, "r")]:
+        if val and str(val).strip().lower() not in ("auto", ""):
+            try:
+                v = int(val)
+                if v < 0:
+                    raise ValueError
+                if setter == "f":
+                    trunc_f_override = v
+                else:
+                    trunc_r_override = v
+            except ValueError:
+                return (
+                    *no_change,
+                    dbc.Alert(f"Invalid {label} value: '{val}'. Enter a number or 'auto'.", color="danger"),
+                    no_update, no_update,
+                )
 
     from datetime import datetime as _dt
     dataset_name = f"Run_{_dt.utcnow().strftime('%Y%m%d_%H%M%S')}"
@@ -1565,11 +1771,14 @@ def on_start_pipeline(n_clicks, checked_samples, file_ids_map, threads_val, erro
         )
 
     sel_info = defaultdict(lambda: {"directions": set(), "region": None})
-    for f, region in sel_results:
+    for f, upload_region in sel_results:
         s = sel_info[f.sample_name]
         s["directions"].add(f.read_direction)
-        if region:
-            s["region"] = region
+        # Prefer per-file region; fall back to upload-level
+        if f.variable_region:
+            s["region"] = f.variable_region
+        elif upload_region and not s["region"]:
+            s["region"] = upload_region
 
     types = set()
     regions = set()
@@ -1604,6 +1813,10 @@ def on_start_pipeline(n_clicks, checked_samples, file_ids_map, threads_val, erro
     is_v19 = region_str == "V1-V9"
     if is_v19:
         trunc_note = f"Long-read mode: no truncation, error model = {error_model_val or 'PacBio'}"
+    elif trunc_f_override is not None or trunc_r_override is not None:
+        f_str = str(trunc_f_override) if trunc_f_override is not None else "auto"
+        r_str = str(trunc_r_override) if trunc_r_override is not None else "auto"
+        trunc_note = f"Truncation: R1={f_str}, R2={r_str}"
     else:
         trunc_note = "Truncation parameters will be auto-detected from quality profiles."
 
@@ -1638,6 +1851,8 @@ def on_start_pipeline(n_clicks, checked_samples, file_ids_map, threads_val, erro
             name=dataset_name,
             threads=threads,
             error_model=error_model,
+            trunc_len_f=trunc_f_override,
+            trunc_len_r=trunc_r_override,
         )
     except Exception as e:
         return (
@@ -2181,6 +2396,7 @@ def launch_analysis(n_clicks, checked_history,
     # Query per-sample ASV table paths across all selected datasets
     with get_session() as db:
         sample_table_paths = []
+        paths_by_dataset = {}  # {dataset_id: [path, ...]}
         has_taxonomy = True
         for dataset_id, sample_names in by_dataset.items():
             ds = db.query(Dataset).filter(Dataset.id == dataset_id).first()
@@ -2191,7 +2407,9 @@ def launch_analysis(n_clicks, checked_history,
                 .filter(Sample.dataset_id == dataset_id, Sample.sample_name.in_(sample_names))
                 .all()
             )
-            sample_table_paths.extend(str(to_absolute(s.asv_table_path)) for s in samples if s.asv_table_path)
+            ds_paths = [str(to_absolute(s.asv_table_path)) for s in samples if s.asv_table_path]
+            paths_by_dataset[dataset_id] = ds_paths
+            sample_table_paths.extend(ds_paths)
 
     if not sample_table_paths:
         err = dbc.Alert("No per-sample ASV tables found for selected samples.", color="danger")
@@ -2204,6 +2422,7 @@ def launch_analysis(n_clicks, checked_history,
             selected_groups.append(id_dict["index"])
 
     # Launch SourceTracker
+    all_dataset_ids = list(by_dataset.keys())
     st_run_id = launch_sourcetracker_run(
         sample_table_paths=sample_table_paths,
         selected_groups=selected_groups,
@@ -2213,7 +2432,8 @@ def launch_analysis(n_clicks, checked_history,
         restarts=restarts or 10,
         burnin=burnin or 100,
         draws=draws or 1,
-        dataset_id=dataset_id,
+        dataset_ids=all_dataset_ids,
+        paths_by_dataset=paths_by_dataset,
         threads=st_threads or 4,
     )
 
@@ -2227,7 +2447,7 @@ def launch_analysis(n_clicks, checked_history,
         tax_run_id = launch_pathogen_run(
             sample_table_paths=sample_table_paths,
             silva_identity=(identity or 97) / 100.0,
-            dataset_id=dataset_id,
+            dataset_ids=all_dataset_ids,
             threads=tax_threads or 4,
         )
         tax_progress = dbc.Card(dbc.CardBody([

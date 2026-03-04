@@ -59,31 +59,47 @@ def run_cutadapt(
         list(fastq_dir.glob("*.fastq.gz")) + list(fastq_dir.glob("*.fq.gz"))
     )
 
-    if not _primers_present(fastq_files, fwd_primer, logger):
+    primers_found = _primers_present(fastq_files, fwd_primer, logger)
+    if not primers_found:
+        if not rev_primer:
+            logger.info(
+                "Primers not detected in reads and no reverse primer for 3' trimming. "
+                "Skipping Cutadapt."
+            )
+            _symlink_files(fastq_dir, trimmed_dir)
+            return {
+                "success": True,
+                "trimmed_dir": str(trimmed_dir),
+                "trim_stats": {"skipped": True, "reason": "primers_absent"},
+            }
         logger.info(
-            "Primers not detected in reads — files appear already trimmed. "
-            "Skipping Cutadapt."
+            "Primers not detected in reads — files appear already 5'-trimmed. "
+            "Will still trim 3' read-through adapters."
         )
-        _symlink_files(fastq_dir, trimmed_dir)
-        return {
-            "success": True,
-            "trimmed_dir": str(trimmed_dir),
-            "trim_stats": {"skipped": True, "reason": "primers_absent"},
-        }
 
     trim_stats = {"total_reads": 0, "trimmed_reads": 0, "samples_processed": 0}
 
     if is_long_read(variable_region):
+        if not primers_found:
+            _symlink_files(fastq_dir, trimmed_dir)
+            return {
+                "success": True,
+                "trimmed_dir": str(trimmed_dir),
+                "trim_stats": {"skipped": True, "reason": "primers_absent"},
+            }
         _trim_long_read(
             fastq_files, trimmed_dir, fwd_primer, rev_primer, logger, trim_stats, threads
         )
     elif is_paired:
         _trim_paired(
-            fastq_files, trimmed_dir, fwd_primer, rev_primer, logger, trim_stats, threads
+            fastq_files, trimmed_dir, fwd_primer, rev_primer, logger, trim_stats, threads,
+            skip_5prime=not primers_found,
         )
     else:
         _trim_single(
-            fastq_files, trimmed_dir, fwd_primer, logger, trim_stats, threads
+            fastq_files, trimmed_dir, fwd_primer, logger, trim_stats, threads,
+            rev_primer=rev_primer,
+            skip_5prime=not primers_found,
         )
 
     logger.info(
@@ -132,6 +148,7 @@ def _trim_paired(
     logger: logging.Logger,
     stats: dict,
     threads: int = 1,
+    skip_5prime: bool = False,
 ):
     """Trim paired-end files sample by sample."""
     filenames = [f.name for f in fastq_files]
@@ -149,10 +166,18 @@ def _trim_paired(
         r1_out = trimmed_dir / r1_name
         r2_out = trimmed_dir / r2_name
 
-        # Anchored primers — ^ prevents internal matches
-        primer_args = ["-g", f"^{fwd_primer}"]
+        primer_args = []
+        if not skip_5prime:
+            # 5' anchored primers — ^ prevents internal matches
+            primer_args += ["-g", f"^{fwd_primer}"]
+            if rev_primer:
+                primer_args += ["-G", f"^{rev_primer}"]
+        # 3' read-through trimming: when reads extend past the amplicon,
+        # trim the RC of the opposite primer + any trailing adapter.
         if rev_primer:
-            primer_args += ["-G", f"^{rev_primer}"]
+            primer_args += ["-a", _reverse_complement(rev_primer)]
+        if fwd_primer:
+            primer_args += ["-A", _reverse_complement(fwd_primer)]
 
         cmd = [
             "cutadapt",
@@ -181,14 +206,22 @@ def _trim_single(
     logger: logging.Logger,
     stats: dict,
     threads: int = 1,
+    rev_primer: str = "",
+    skip_5prime: bool = False,
 ):
     """Trim single-end files."""
     for fq in fastq_files:
         out = trimmed_dir / fq.name
+        adapter_args = []
+        if not skip_5prime:
+            adapter_args += ["-g", f"^{fwd_primer}"]
+        # 3' read-through trimming
+        if rev_primer:
+            adapter_args += ["-a", _reverse_complement(rev_primer)]
         cmd = [
             "cutadapt",
             "-j", str(threads),
-            "-g", f"^{fwd_primer}",
+            *adapter_args,
             "--minimum-length", "50",
             "-o", str(out),
             str(fq),

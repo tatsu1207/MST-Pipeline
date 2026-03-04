@@ -144,6 +144,8 @@ def launch_dada2_pipeline(
     name: str,
     threads: int | None = None,
     error_model: str = "default",
+    trunc_len_f: int | None = None,
+    trunc_len_r: int | None = None,
 ) -> int:
     """Create a Dataset record and launch DADA2 in a background thread.
 
@@ -167,8 +169,12 @@ def launch_dada2_pipeline(
         upload_map = {u.id: u for u in uploads}
 
         seq_types = set(u.sequencing_type for u in uploads if u.sequencing_type)
-        regions = set(u.variable_region for u in uploads if u.variable_region)
         seq_type = seq_types.pop() if len(seq_types) == 1 else "paired-end"
+
+        # Prefer per-file variable_region; fall back to upload-level
+        regions = set(f.variable_region for f in fastq_files if f.variable_region)
+        if not regions:
+            regions = set(u.variable_region for u in uploads if u.variable_region)
         variable_region = regions.pop() if len(regions) == 1 else None
 
         # Auto-compute threads: samples x 2 capped at CPUs - 1
@@ -204,6 +210,7 @@ def launch_dada2_pipeline(
     t = threading.Thread(
         target=_run_dada2_pipeline,
         args=(dataset_id, file_ids, resolved_threads),
+        kwargs={"trunc_len_f": trunc_len_f, "trunc_len_r": trunc_len_r},
         daemon=True,
         name=f"dada2-{dataset_id}",
     )
@@ -212,7 +219,8 @@ def launch_dada2_pipeline(
     return dataset_id
 
 
-def _run_dada2_pipeline(dataset_id: int, file_ids: list[int], threads: int):
+def _run_dada2_pipeline(dataset_id: int, file_ids: list[int], threads: int,
+                        trunc_len_f: int | None = None, trunc_len_r: int | None = None):
     """Execute full DADA2 pipeline in background thread.
 
     Uses file_ids (FastqFile IDs) selected by the user, not upload_id.
@@ -302,8 +310,6 @@ def _run_dada2_pipeline(dataset_id: int, file_ids: list[int], threads: int):
             error_model = dataset.error_model or "default"
 
         min_overlap = defaults["min_overlap"]
-        trim_left_f = defaults["trim_left_f"]
-        trim_left_r = defaults["trim_left_r"]
 
         auto = detect_truncation_params(
             trimmed_dir=trimmed_dir,
@@ -314,6 +320,17 @@ def _run_dada2_pipeline(dataset_id: int, file_ids: list[int], threads: int):
         )
         trunc_f = auto["trunc_len_f"]
         trunc_r = auto["trunc_len_r"]
+        trim_left_f = auto.get("trim_left_f", defaults["trim_left_f"])
+        trim_left_r = auto.get("trim_left_r", defaults["trim_left_r"])
+
+        # Apply user overrides if provided
+        if trunc_len_f is not None:
+            logger.info(f"User override: trunc_len_f {trunc_f} → {trunc_len_f}")
+            trunc_f = trunc_len_f
+        if trunc_len_r is not None:
+            logger.info(f"User override: trunc_len_r {trunc_r} → {trunc_len_r}")
+            trunc_r = trunc_len_r
+
         dataset.trunc_len_f = trunc_f
         dataset.trunc_len_r = trunc_r
         db.commit()
@@ -390,6 +407,23 @@ def _run_dada2_pipeline(dataset_id: int, file_ids: list[int], threads: int):
         asv_df = pd.read_csv(tsv_path, sep="\t")
         asv_df = asv_df.set_index("sequence").drop(columns=["ASV_ID"], errors="ignore")
 
+        # Load taxonomy for inclusion in per-sample files
+        tax_cols = ["Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"]
+        tax_path = Path(taxonomy_result["taxonomy_path"])
+        seq_tax = pd.DataFrame(index=asv_df.index, columns=tax_cols)
+        try:
+            tax_df = pd.read_csv(tax_path, sep="\t")
+            # Build ASV_ID → sequence mapping
+            raw_asv = pd.read_csv(tsv_path, sep="\t")
+            id_to_seq = dict(zip(raw_asv["ASV_ID"], raw_asv["sequence"]))
+            for _, row in tax_df.iterrows():
+                seq = id_to_seq.get(row["ASV_ID"])
+                if seq and seq in seq_tax.index:
+                    for c in tax_cols:
+                        seq_tax.at[seq, c] = row.get(c)
+        except Exception as e:
+            logger.warning(f"Could not load taxonomy for per-sample files: {e}")
+
         samples_dir = output_dir / "samples"
         samples_dir.mkdir(parents=True, exist_ok=True)
 
@@ -401,11 +435,11 @@ def _run_dada2_pipeline(dataset_id: int, file_ids: list[int], threads: int):
         # Create Sample rows with per-sample csv.gz files
         for sname in asv_df.columns:
             col = asv_df[sname]
-            col_nonzero = col[col > 0]
+            mask = col > 0
+            out_df = seq_tax.loc[mask].copy()
+            out_df[sname] = col[mask]
             sample_path = samples_dir / f"{sname}.csv.gz"
-            col_nonzero.to_frame(name=sname).to_csv(
-                sample_path, compression="gzip"
-            )
+            out_df.to_csv(sample_path, compression="gzip")
 
             track = dada2_result["track_reads"].get(sname, {})
             sample = Sample(
@@ -414,7 +448,7 @@ def _run_dada2_pipeline(dataset_id: int, file_ids: list[int], threads: int):
                 read_count_raw=track.get("input"),
                 read_count_filtered=track.get("filtered"),
                 read_count_nonchimeric=track.get("nonchim"),
-                asv_count=len(col_nonzero),
+                asv_count=int(mask.sum()),
                 asv_table_path=to_relative(sample_path),
             )
             db.add(sample)
@@ -479,6 +513,8 @@ def launch_sourcetracker_run(
     burnin: int = 100,
     draws: int = 1,
     dataset_id: int | None = None,
+    dataset_ids: list[int] | None = None,
+    paths_by_dataset: dict[int, list[str]] | None = None,
     name: str = "SourceTracker Run",
     threads: int = 4,
 ) -> int:
@@ -489,10 +525,14 @@ def launch_sourcetracker_run(
     from app.db.database import SessionLocal
     from app.db.models import SourcetrackerRun
 
+    # Normalize: prefer dataset_ids list, fall back to single dataset_id
+    if dataset_ids is None and dataset_id is not None:
+        dataset_ids = [dataset_id]
+
     db = SessionLocal()
     try:
         run = SourcetrackerRun(
-            dataset_id=dataset_id,
+            dataset_id=dataset_ids[0] if dataset_ids else dataset_id,
             name=name,
             status="pending",
             input_biom_path=None,
@@ -520,7 +560,7 @@ def launch_sourcetracker_run(
 
     t = threading.Thread(
         target=_run_sourcetracker,
-        args=(run_id, sample_table_paths, threads),
+        args=(run_id, sample_table_paths, dataset_ids or [], paths_by_dataset or {}, threads),
         daemon=True,
         name=f"st-{run_id}",
     )
@@ -572,7 +612,10 @@ def get_sourcetracker_status(run_id: int) -> dict:
     }
 
 
-def _run_sourcetracker(run_id: int, sample_table_paths: list[str], threads: int = 4):
+def _run_sourcetracker(run_id: int, sample_table_paths: list[str],
+                       dataset_ids: list[int] | None = None,
+                       paths_by_dataset: dict[int, list[str]] | None = None,
+                       threads: int = 4):
     """Execute SourceTracker pipeline in background thread."""
     import json as _json
     import pandas as pd
@@ -603,28 +646,60 @@ def _run_sourcetracker(run_id: int, sample_table_paths: list[str], threads: int 
         from app.pipeline.sourcetracker import (
             load_csv_gz, load_fasta, load_design,
             align_features, collapse_by_group, run_gibbs_subprocess,
-            extract_v4_from_full_length,
+            extract_v4_region,
         )
         from app.config import SOURCE_TABLE, SOURCE_FASTA, SOURCE_DESIGN
 
         _update_status(run_dir, "loading", 5, [])
 
-        # Load and merge per-sample csv.gz files
-        dfs = [load_csv_gz(p) for p in sample_table_paths]
-        sink_df = pd.concat(dfs, axis=1).fillna(0).astype(int)
-        logger.info(f"  Merged {len(sample_table_paths)} sample tables → {sink_df.shape[0]} ASVs x {sink_df.shape[1]} samples")
-
-        # If the dataset used full-length 16S, extract V4 sub-region before alignment
+        # Load per-sample csv.gz files, applying per-dataset V4 extraction
         from app.db.models import Dataset
-        dataset_vregion = None
-        if run.dataset_id:
-            ds = db.query(Dataset).filter(Dataset.id == run.dataset_id).first()
-            if ds:
-                dataset_vregion = ds.variable_region
-        if is_long_read(dataset_vregion):
-            logger.info("Full-length 16S detected — extracting V4 sub-region for source alignment...")
-            _update_status(run_dir, "v4_extraction", 10, [])
-            sink_df = extract_v4_from_full_length(sink_df, logger=logger)
+        _tax_cols = {"Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"}
+        all_ds_ids = dataset_ids or ([run.dataset_id] if run.dataset_id else [])
+
+        # Build dataset_id → variable_region mapping
+        ds_vregions = {}
+        for ds_id in all_ds_ids:
+            ds = db.query(Dataset).filter(Dataset.id == ds_id).first()
+            if ds and ds.variable_region:
+                ds_vregions[ds_id] = ds.variable_region
+
+        # If we have paths_by_dataset, load per-dataset with correct V4 extraction
+        extracted_dfs = []
+        if paths_by_dataset:
+            for ds_id, paths in paths_by_dataset.items():
+                dfs = []
+                for p in paths:
+                    df = load_csv_gz(p)
+                    df = df.drop(columns=[c for c in df.columns if c in _tax_cols], errors="ignore")
+                    dfs.append(df)
+                if not dfs:
+                    continue
+                ds_df = pd.concat(dfs, axis=1).fillna(0).astype(int)
+                vregion = ds_vregions.get(ds_id)
+                if vregion and vregion != "V4":
+                    logger.info(f"Dataset {ds_id} ({vregion}) — extracting V4 sub-region...")
+                    _update_status(run_dir, "v4_extraction", 10, [])
+                    ds_df = extract_v4_region(ds_df, vregion, logger=logger)
+                extracted_dfs.append(ds_df)
+            sink_df = pd.concat(extracted_dfs, axis=1).fillna(0).astype(int)
+        else:
+            # Fallback: flat list without per-dataset info
+            dfs = []
+            for p in sample_table_paths:
+                df = load_csv_gz(p)
+                df = df.drop(columns=[c for c in df.columns if c in _tax_cols], errors="ignore")
+                dfs.append(df)
+            sink_df = pd.concat(dfs, axis=1).fillna(0).astype(int)
+            # Apply V4 extraction if any non-V4 region
+            non_v4 = set(ds_vregions.values()) - {"V4"}
+            if non_v4:
+                vregion = sorted(non_v4)[0]
+                logger.info(f"{vregion} detected — extracting V4 sub-region...")
+                _update_status(run_dir, "v4_extraction", 10, [])
+                sink_df = extract_v4_region(sink_df, vregion, logger=logger)
+
+        logger.info(f"  Loaded {sink_df.shape[0]} ASVs x {sink_df.shape[1]} samples")
 
         source_df = load_csv_gz(str(SOURCE_TABLE))
         db_fasta = load_fasta(str(SOURCE_FASTA))
@@ -857,7 +932,12 @@ def _run_taxonomy_for_dataset(dataset_id: int, sample_paths: list[str], threads:
         logger.info(f"Taxonomy pipeline started for dataset {dataset_id}")
 
         # Load and merge all per-sample csv.gz to collect unique sequences
-        dfs = [load_csv_gz(p) for p in sample_paths]
+        _tax_cols = {"Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"}
+        dfs = []
+        for p in sample_paths:
+            df = load_csv_gz(p)
+            df = df.drop(columns=[c for c in df.columns if c in _tax_cols], errors="ignore")
+            dfs.append(df)
         merged = pd.concat(dfs, axis=1).fillna(0).astype(int)
         sequences = list(merged.index)
         logger.info(f"Collected {len(sequences)} unique ASV sequences")
@@ -923,6 +1003,7 @@ def launch_pathogen_run(
     sample_table_paths: list[str],
     silva_identity: float = 0.97,
     dataset_id: int | None = None,
+    dataset_ids: list[int] | None = None,
     name: str = "Pathogen Run",
     threads: int = 4,
 ) -> int:
@@ -930,10 +1011,14 @@ def launch_pathogen_run(
     from app.db.database import SessionLocal
     from app.db.models import PathogenRun
 
+    # Normalize: prefer dataset_ids list, fall back to single dataset_id
+    if dataset_ids is None and dataset_id is not None:
+        dataset_ids = [dataset_id]
+
     db = SessionLocal()
     try:
         run = PathogenRun(
-            dataset_id=dataset_id,
+            dataset_id=dataset_ids[0] if dataset_ids else dataset_id,
             name=name,
             status="pending",
             input_biom_path=None,
@@ -955,7 +1040,7 @@ def launch_pathogen_run(
 
     t = threading.Thread(
         target=_run_pathogen,
-        args=(run_id, sample_table_paths, threads),
+        args=(run_id, sample_table_paths, dataset_ids or [], threads),
         daemon=True,
         name=f"pathogen-{run_id}",
     )
@@ -1003,7 +1088,8 @@ def get_pathogen_status(run_id: int) -> dict:
     }
 
 
-def _run_pathogen(run_id: int, sample_table_paths: list[str], threads: int = 4):
+def _run_pathogen(run_id: int, sample_table_paths: list[str],
+                  dataset_ids: list[int] | None = None, threads: int = 4):
     """Execute pathogen detection pipeline in background thread."""
     import pandas as pd
     from app.db.database import SessionLocal
@@ -1032,8 +1118,13 @@ def _run_pathogen(run_id: int, sample_table_paths: list[str], threads: int = 4):
 
         _update_status(run_dir, "loading", 10, [])
 
-        # Load and merge per-sample csv.gz files
-        dfs = [load_csv_gz(p) for p in sample_table_paths]
+        # Load and merge per-sample csv.gz files (drop taxonomy columns, keep counts only)
+        _tax_cols = {"Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"}
+        dfs = []
+        for p in sample_table_paths:
+            df = load_csv_gz(p)
+            df = df.drop(columns=[c for c in df.columns if c in _tax_cols], errors="ignore")
+            dfs.append(df)
         asv_df = pd.concat(dfs, axis=1).fillna(0).astype(int)
         logger.info(f"  Merged {len(sample_table_paths)} sample tables → {asv_df.shape[0]} ASVs x {asv_df.shape[1]} samples")
 
@@ -1043,40 +1134,43 @@ def _run_pathogen(run_id: int, sample_table_paths: list[str], threads: int = 4):
         _check_cancel(key)
         _update_status(run_dir, "classifying", 30, [])
 
-        # Load pre-computed taxonomy from DADA2 pipeline
+        # Load pre-computed taxonomy from ALL involved datasets
         from app.db.models import Dataset
-        taxonomy_path = None
-        if run.dataset_id:
-            ds = db.query(Dataset).filter(Dataset.id == run.dataset_id).first()
-            if ds and ds.taxonomy_path:
-                taxonomy_path = to_absolute(ds.taxonomy_path)
+        all_ds_ids = dataset_ids or ([run.dataset_id] if run.dataset_id else [])
 
-        if not taxonomy_path or not taxonomy_path.exists():
-            raise RuntimeError("No taxonomy data found. Please re-run DADA2 for this dataset.")
-
-        logger.info("Loading pre-computed taxonomy...")
-        tax_df = pd.read_csv(taxonomy_path, sep="\t")
-
-        # Build ASV_ID → sequence mapping from rep_seqs.fasta
-        rep_seqs_path = taxonomy_path.parent / "rep_seqs.fasta"
-        asv_to_seq = {}
-        with open(rep_seqs_path) as fh:
-            asv_id = None
-            for line in fh:
-                line = line.strip()
-                if line.startswith(">"):
-                    asv_id = line[1:]
-                elif asv_id:
-                    asv_to_seq[asv_id] = line
-                    asv_id = None
-
-        # Build sequence → genus mapping
         seq_to_genus = {}
-        for _, row in tax_df.iterrows():
-            seq = asv_to_seq.get(row["ASV_ID"])
-            if seq:
-                genus = row.get("Genus")
-                seq_to_genus[seq] = genus if pd.notna(genus) else None
+        for ds_id in all_ds_ids:
+            ds = db.query(Dataset).filter(Dataset.id == ds_id).first()
+            if not ds or not ds.taxonomy_path:
+                continue
+            taxonomy_path = to_absolute(ds.taxonomy_path)
+            if not taxonomy_path.exists():
+                continue
+
+            logger.info(f"Loading taxonomy from dataset {ds_id} ({ds.name})...")
+            tax_df = pd.read_csv(taxonomy_path, sep="\t")
+
+            rep_seqs_path = taxonomy_path.parent / "rep_seqs.fasta"
+            asv_to_seq = {}
+            with open(rep_seqs_path) as fh:
+                asv_id = None
+                for line in fh:
+                    line = line.strip()
+                    if line.startswith(">"):
+                        asv_id = line[1:]
+                    elif asv_id:
+                        asv_to_seq[asv_id] = line
+                        asv_id = None
+
+            for _, row in tax_df.iterrows():
+                seq = asv_to_seq.get(row["ASV_ID"])
+                if seq and seq not in seq_to_genus:
+                    genus = row.get("Genus")
+                    seq_to_genus[seq] = genus if pd.notna(genus) else None
+
+        if not seq_to_genus:
+            raise RuntimeError("No taxonomy data found. Please re-run DADA2 for selected datasets.")
+
         n_classified = sum(1 for g in seq_to_genus.values() if g)
         logger.info(f"Loaded {n_classified}/{len(sequences)} genus assignments")
 

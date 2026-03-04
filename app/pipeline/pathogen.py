@@ -42,6 +42,19 @@ PATHOGENS = {
     "Mycobacterium": "other",
     "Arcobacter": "other",
     "Aliarcobacter": "other",
+    # Waterborne & fecal-associated pathogens (MST-relevant)
+    "Aeromonas": "other",
+    "Plesiomonas": "other",
+    "Leptospira": "other",
+    "Bacteroides": "other",
+    "Treponema": "other",
+    "Prevotella": "other",
+    "Fusobacterium": "other",
+    "Veillonella": "other",
+    "Edwardsiella": "other",
+    "Citrobacter": "other",
+    "Hafnia": "other",
+    "Cronobacter": "other",
 }
 
 _PRIORITY_ORDER = ["critical", "high", "medium", "other"]

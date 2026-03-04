@@ -128,8 +128,8 @@ def _reverse_complement(seq: str) -> str:
 REGION_PRIMERS = {
     "V4": {
         "forward": "GTGYCAGCMGCCGCGGTAA",         # 515F
-        "reverse": "GGACTACNVGGGTWTCTAAT",          # 806R
-        "expected_len": (240, 260),
+        "reverse": "GGACTACNVGGGTWTCTAATCC",        # 806R + 2bp boundary
+        "expected_len": (282, 302),
     },
     "V3-V4": {
         "forward": "CCTACGGGNGGCWGCAG",             # 341F
@@ -379,8 +379,14 @@ def _parse_sam(sam_file):
     return starts, ends
 
 
-def detect_variable_region(fastq_path: Path, n_reads: int = 100) -> dict:
+def detect_variable_region(
+    fastq_path: Path, n_reads: int = 100, r2_path: Path | None = None,
+) -> dict:
     """Detect the 16S variable region from primer sequences in FASTQ reads.
+
+    For PE data, pass *r2_path* to check reverse primers in R2 reads, which
+    is essential for disambiguating regions that share the same forward primer
+    (e.g. V4 vs V4-V5 both use 515F).
 
     Returns dict with keys: region, confidence, method, details
     """
@@ -393,10 +399,15 @@ def detect_variable_region(fastq_path: Path, n_reads: int = 100) -> dict:
             "method": "none", "details": "Could not read sequences from file.",
         }
 
+    # Read R2 sequences when available (PE reverse-primer disambiguation)
+    r2_sequences: list[str] = []
+    if r2_path and Path(r2_path).exists():
+        r2_sequences = _read_fastq_sequences(Path(r2_path), n_reads)
+
     # Read-length heuristic: if average read length > 1000bp, strongly favor V1-V9
     avg_len = sum(len(s) for s in sequences) / len(sequences) if sequences else 0
 
-    # Count primer matches for each region (forward direction)
+    # Count primer matches for each region (forward direction on R1)
     region_primers = {
         "V4": PRIMERS["515F"],
         "V3-V4": "CCTACGGGNGGCWGCAG",
@@ -413,6 +424,19 @@ def detect_variable_region(fastq_path: Path, n_reads: int = 100) -> dict:
         rc_27f = _reverse_complement(PRIMERS["27F"])
         if _primer_matches(seq, rc_27f):
             region_scores["V1-V9"] += 1
+
+    # Reverse-primer scoring: check R2 start for reverse primers (PE)
+    if r2_sequences:
+        _rev_primers = {
+            "V4": REGION_PRIMERS["V4"]["reverse"],
+            "V3-V4": REGION_PRIMERS["V3-V4"]["reverse"],
+            "V4-V5": REGION_PRIMERS["V4-V5"]["reverse"],
+            "V1-V9": REGION_PRIMERS["V1-V9"]["reverse"],
+        }
+        for seq in r2_sequences:
+            for region_name, rev_primer in _rev_primers.items():
+                if _primer_matches(seq, rev_primer):
+                    region_scores[region_name] += 1
 
     # Apply read-length bonus for V1-V9 when reads are long
     if avg_len > 1000 and "V1-V9" in region_scores:
@@ -443,11 +467,25 @@ def detect_variable_region(fastq_path: Path, n_reads: int = 100) -> dict:
 
     best_region = max(region_scores, key=region_scores.get)
     best_count = region_scores[best_region]
+
+    # Break ties using expected amplicon length proximity to avg read length.
+    # Handles SE disambiguation (e.g. V4 ~250bp vs V4-V5 ~400bp) and cases
+    # where R2 is unavailable.
+    tied = [r for r, c in region_scores.items() if c == best_count]
+    if len(tied) > 1 and avg_len > 0:
+        def _len_distance(region):
+            info = REGION_PRIMERS.get(region, {})
+            lo, hi = info.get("expected_len", (0, 0))
+            mid = (lo + hi) / 2
+            return abs(avg_len - mid) if mid > 0 else float("inf")
+        best_region = min(tied, key=_len_distance)
+        best_count = region_scores[best_region]
+
     confidence = best_count / len(sequences)
 
     return {
         "region": best_region,
         "confidence": round(confidence, 2),
         "method": "primer_match",
-        "details": f"{best_count}/{len(sequences)} reads matched {best_region} forward primer.",
+        "details": f"{best_count}/{len(sequences)} reads matched {best_region} primer(s).",
     }

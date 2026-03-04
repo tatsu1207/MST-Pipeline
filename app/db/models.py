@@ -76,9 +76,11 @@ class FastqFile(Base):
     filename: Mapped[str] = mapped_column(String, nullable=False)
     file_path: Mapped[str] = mapped_column(String, nullable=False)
     read_direction: Mapped[str | None] = mapped_column(String)  # R1/R2/single
+    variable_region: Mapped[str | None] = mapped_column(String)
     file_size_mb: Mapped[float | None] = mapped_column(Float)
     read_count: Mapped[int | None] = mapped_column(Integer)
     avg_read_length: Mapped[int | None] = mapped_column(Integer)
+    quality_trunc: Mapped[int | None] = mapped_column(Integer)  # EE≤5 ≥50% cutoff
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     upload: Mapped["Upload"] = relationship(back_populates="fastq_files")
